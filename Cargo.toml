@@ -6,7 +6,7 @@ members = ["crates/nodal-core", "crates/nodal-tiler", "crates/nodal-render", "cr
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/au12/nodal"
+repository = "https://github.com/au12/Nodal"
 rust-version = "1.95"
 
 [workspace.dependencies]

@@ -1,5 +1,8 @@
 name: Release binaries
 
+# Linux and Windows builds of the `nodal` app/CLI for tagged releases.
+# The macOS app (Nodal.app) is built by macos.yml.
+
 on:
   push:
     tags: ["v*"]
@@ -15,8 +18,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, archive: tar.gz }
-          - { os: macos-latest, target: aarch64-apple-darwin, archive: tar.gz }
-          - { os: macos-13, target: x86_64-apple-darwin, archive: tar.gz }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, archive: zip }
     runs-on: ${{ matrix.os }}
     steps:
@@ -27,18 +29,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --locked -p nodal-app --bin nodal --target ${{ matrix.target }}
-      - name: Package (unix)
+      - name: Package (Linux)
         if: matrix.archive == 'tar.gz'
         run: |
-          mkdir -p dist && cp target/${{ matrix.target }}/release/nodal dist/ && cp README.md LICENSE dist/
-          tar -C dist -czf nodal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz .
-      - name: Package (windows)
+          mkdir -p pkg && cp target/${{ matrix.target }}/release/nodal pkg/ && cp README.md LICENSE pkg/
+          tar -C pkg -czf nodal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz .
+      - name: Package (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/nodal.exe, README.md, LICENSE dist/
-          Compress-Archive -Path dist/* -DestinationPath nodal-${{ github.ref_name }}-${{ matrix.target }}.zip
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/nodal.exe, README.md, LICENSE pkg/
+          Compress-Archive -Path pkg/* -DestinationPath nodal-${{ github.ref_name }}-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nodal-${{ matrix.target }}
+          path: nodal-${{ github.ref_name }}-${{ matrix.target }}.*
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:

@@ -2,18 +2,18 @@
 <Container version="2">
   <Name>Nodal</Name>
   <Repository>ghcr.io/au12/nodal:latest</Repository>
-  <Registry>https://github.com/au12/nodal/pkgs/container/nodal</Registry>
+  <Registry>https://github.com/au12/Nodal/pkgs/container/nodal</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/au12/nodal/issues</Support>
-  <Project>https://github.com/au12/nodal</Project>
+  <Support>https://github.com/au12/Nodal/issues</Support>
+  <Project>https://github.com/au12/Nodal</Project>
   <Overview>Nodal is a fast, GPU-accelerated 360° panorama viewer and virtual tour builder. Upload equirectangular panoramas from the browser; Nodal tiles them into multi-resolution cube pyramids and serves a WebGPU/WebGL viewer with hotspots, polygon areas, zoom-through transitions, little-planet, fisheye and Pannini projections, deep links, and a built-in tour editor. Set an access token to protect uploads and edits.</Overview>
   <Category>MediaServer:Photos MediaApp:Photos Tools:</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/au12/nodal/main/unraid/nodal.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/au12/nodal/main/assets/icon-512.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/au12/Nodal/main/unraid/nodal.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/au12/Nodal/main/assets/icon-512.png</Icon>
   <ExtraParams/>
   <PostArgs/>
   <CPUset/>
