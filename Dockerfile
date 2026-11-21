@@ -12,12 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends brotli && rm -r
  && rustup target add wasm32-unknown-unknown
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=nodal-web-registry,target=/usr/local/cargo/registry,sharing=locked \
     WBV=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p') \
  && cargo install wasm-bindgen-cli --version "$WBV" --locked
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,id=nodal-web-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=nodal-web-target,target=/src/target,sharing=locked \
     ./scripts/build-web.sh /out/web
 
 # ---- Server (cross-compiled for the target platform) ----------------------------------
@@ -34,8 +34,11 @@ RUN case "$TARGETARCH" in \
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+# Separate, locked cache mounts per stage: the web and server stages (and the per-architecture
+# server builds) run in parallel, and cargo's registry lock lives outside the mounted directory,
+# so a shared registry mount lets two cargo processes unpack the same crate at once.
+RUN --mount=type=cache,id=nodal-server-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=nodal-server-target,target=/src/target,sharing=locked \
     cargo build --release --locked -p nodal-server --target "$(cat /target)" \
  && mkdir -p /out && cp "target/$(cat /target)/release/nodal-server" /out/
 
