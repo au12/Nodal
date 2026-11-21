@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM gcr.io/distroless/cc-debian12
 LABEL org.opencontainers.image.title="Nodal" \
       org.opencontainers.image.description="Fast, GPU-accelerated 360° panorama viewer and virtual tour server" \
-      org.opencontainers.image.source="https://github.com/au12/nodal" \
+      org.opencontainers.image.source="https://github.com/au12/Nodal" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=server /out/nodal-server /usr/local/bin/nodal-server
 COPY --from=web /out/web /app/web

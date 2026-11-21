@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use nodal_core::{Projection, Tour, View};
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -108,10 +109,22 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                 ..Default::default()
             };
             let t0 = Instant::now();
+            // Live single-line progress on a terminal; one line per stage in logs (CI, pipes).
+            let tty = std::io::stderr().is_terminal();
+            let last_stage = std::sync::Mutex::new(String::new());
             let tour = nodal_tiler::build_tour(&images, &out, title.as_deref(), &opts, &|f, stage| {
-                eprint!("\r\x1b[2K{:>5.1}%  {stage}", f * 100.0);
+                if tty {
+                    eprint!("\r\x1b[2K{:>5.1}%  {stage}", f * 100.0);
+                } else if let Ok(mut last) = last_stage.lock() {
+                    if *last != stage {
+                        eprintln!("{:>5.1}%  {stage}", f * 100.0);
+                        *last = stage.to_string();
+                    }
+                }
             })?;
-            eprintln!();
+            if tty {
+                eprintln!();
+            }
             let tiles: u32 = tour.scenes.iter().map(|s| s.pyramid.tile_count()).sum();
             println!("{} scene(s), {} tiles in {:.2?} → {}", tour.scenes.len(), tiles, t0.elapsed(), out.join("tour.json").display());
         }

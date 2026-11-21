@@ -7,7 +7,8 @@ mod cli;
 fn main() -> std::process::ExitCode {
     use clap::Parser;
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,nodal=info,nodal_render=info,nodal_app=info")).init();
-    let args = cli::Cli::parse();
+    // Older macOS versions pass a `-psn_<process serial number>` argument to apps launched from Finder.
+    let args = cli::Cli::parse_from(std::env::args_os().filter(|a| !a.to_string_lossy().starts_with("-psn_")));
     match args.command {
         Some(cmd) => cli::run(cmd),
         None => match gui(args.paths) {
@@ -22,7 +23,13 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn gui(paths: Vec<std::path::PathBuf>) -> eframe::Result<()> {
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).ok();
+    // eframe also sets the Dock icon at runtime on macOS, so give it the macOS-shaped variant
+    // (rounded square with margin and shadow) that matches the app bundle's Nodal.icns.
+    #[cfg(target_os = "macos")]
+    let icon_png: &[u8] = include_bytes!("../assets/icon-macos-512.png");
+    #[cfg(not(target_os = "macos"))]
+    let icon_png: &[u8] = include_bytes!("../assets/icon-256.png");
+    let icon = eframe::icon_data::from_png_bytes(icon_png).ok();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Nodal")
         .with_app_id("nodal")
