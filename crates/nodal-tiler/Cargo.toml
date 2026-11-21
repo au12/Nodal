@@ -1,0 +1,18 @@
+[package]
+name = "nodal-tiler"
+description = "Fast multi-resolution cube tiler for equirectangular panoramas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nodal-core = { path = "../nodal-core" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+jpeg-encoder = { version = "0.6", features = ["simd"] }
+rayon = "1.10"
+anyhow = "1"
+serde_json = "1"
+glam = "0.30"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,22 @@
+[package]
+name = "nodal-server"
+description = "Nodal server: hosts tours and the web viewer, tiles uploads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nodal-core = { path = "../nodal-core" }
+nodal-tiler = { path = "../nodal-tiler" }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "signal", "sync"] }
+tower-http = { version = "0.6", features = ["fs", "compression-br", "compression-gzip", "trace", "set-header"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

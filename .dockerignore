@@ -1,0 +1,9 @@
+target
+dist
+**/node_modules
+.git
+docs/screenshots
+*.png
+!assets/*.png
+!crates/nodal-app/assets/*.png
+!web/*.png
