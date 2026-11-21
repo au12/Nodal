@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0c0d10">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="description" content="Nodal — fast, GPU-accelerated 360° panoramas and virtual tours">
+  <title>Nodal</title>
+  <link rel="icon" type="image/png" href="icon-256.png">
+  <link rel="apple-touch-icon" href="icon-256.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0c0d10; }
+    canvas#nodal_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; touch-action: none; }
+    #loading {
+      position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      color: #a0a6b2; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; text-align: center; padding: 24px;
+    }
+    #loading img { width: 72px; height: 72px; margin-bottom: 18px; animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 0%, 100% { opacity: .45; transform: scale(.96); } 50% { opacity: 1; transform: scale(1); } }
+  </style>
+</head>
+<body>
+  <canvas id="nodal_canvas"></canvas>
+  <div id="loading"><img src="icon-256.png" alt=""><div>Loading Nodal…</div></div>
+  <script type="module">
+    import init from "./pkg/nodal_app.js";
+    init().catch((e) => {
+      console.error(e);
+      document.getElementById("loading").innerHTML = "<p>Nodal failed to load.</p><p>A browser with WebGPU or WebGL 2 is required.</p>";
+    });
+  </script>
+</body>
+</html>

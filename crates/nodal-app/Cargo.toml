@@ -1,0 +1,45 @@
+[package]
+name = "nodal-app"
+description = "Nodal panorama viewer and tour editor (native + web)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "nodal"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nodal"
+path = "src/main.rs"
+
+[dependencies]
+nodal-core = { path = "../nodal-core" }
+nodal-render = { path = "../nodal-render" }
+eframe = { workspace = true, features = ["wgpu", "default_fonts", "persistence"] }
+egui = { workspace = true }
+egui_extras = { version = "0.37", default-features = false, features = ["image", "http", "file"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+glam = "0.30"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eframe = { workspace = true, features = ["wayland", "x11"] }
+nodal-tiler = { path = "../nodal-tiler" }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+rfd = "0.18"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+dirs = "6"
+anyhow = "1"
+pollster = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+rfd = "0.18"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "HtmlElement", "Location", "History", "Response", "Request", "RequestInit", "Headers", "Storage", "Url", "UrlSearchParams", "Blob", "BlobPropertyBag"] }

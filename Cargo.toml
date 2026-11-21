@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/nodal-core", "crates/nodal-tiler", "crates/nodal-render", "crates/nodal-app", "crates/nodal-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/au12/nodal"
+rust-version = "1.95"
+
+[workspace.dependencies]
+eframe = { version = "0.37", default-features = false }
+egui = "0.37"
+
+[profile.release]
+lto = "thin"
+
+# Size-optimised profile for the WebAssembly viewer: `cargo build --profile web --target wasm32-unknown-unknown`.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
