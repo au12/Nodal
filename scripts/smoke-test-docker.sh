@@ -35,10 +35,10 @@ job=$(curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "X-Filename: smoke-
 state=queued
 for _ in $(seq 1 240); do
   state=$(curl -fsS "$B/api/jobs/$job" | json '["state"]')
-  [ "$state" = done ] || [ "$state" = failed ] && break
+  [ "$state" = "done" ] || [ "$state" = "failed" ] && break
   sleep 0.5
 done
-[ "$state" = done ] || { echo "tiling job ended as: $state"; curl -fsS "$B/api/jobs/$job"; exit 1; }
+[ "$state" = "done" ] || { echo "tiling job ended as: $state"; curl -fsS "$B/api/jobs/$job"; exit 1; }
 echo "tiling:      done"
 curl -fsS "$B/api/tours" | grep -q '"id":"smoke-test"' && echo "library:     tour listed"
 curl -fsS "$B/tours/smoke-test/tour.json" | grep -q '"tile_size"' && echo "tour.json:   served"

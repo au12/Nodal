@@ -304,11 +304,19 @@ On Linux the native app needs the usual windowing libraries (`libxkbcommon`, `li
 |---|---|---|
 | [CI](.github/workflows/ci.yml) | push, PR | `rustfmt`, `clippy -D warnings` (native and wasm32), and tests including the GPU-vs-CPU render comparison on lavapipe |
 | [Unraid Docker image](.github/workflows/docker.yml) | push to `main`, `v*` tags, PR | Validates `unraid/nodal.xml`, builds the image and runs an end-to-end smoke test (health, auth, upload → tiling → serving). It then pushes `linux/amd64` + `linux/arm64` to `ghcr.io/au12/nodal` as `latest`, `X.Y.Z`, `X.Y` and `sha-…`; PRs build and test only |
-| [macOS app](.github/workflows/macos.yml) | push to `main`, `v*` tags, PR | Builds `Nodal.app` for Apple Silicon, runs a CLI smoke test and packages a DMG. The DMG is uploaded as an artifact and attached to releases |
-| [Release binaries](.github/workflows/release.yml) | `v*` tags | Linux x86_64/arm64 and Windows x86_64 archives |
+| [macOS app](.github/workflows/macos.yml) | push to `main`, PR, called by Release | Builds `Nodal.app` for Apple Silicon, runs a CLI smoke test and packages a DMG, which is uploaded as the `Nodal-macOS-arm64` artifact |
+| [Release](.github/workflows/release.yml) | `v*` tags | Builds Linux x86_64/arm64 and Windows x86_64 archives plus the macOS app, then publishes one GitHub release. The notes come from [CHANGELOG.md](CHANGELOG.md), and every file is attached with `SHA256SUMS.txt` |
 
-To cut a release, run `git tag v0.1.0 && git push origin v0.1.0`. The DMG, the Linux and Windows
-archives and versioned Docker tags are all published.
+**Cutting a release.** Move the *Unreleased* notes in `CHANGELOG.md` under a new version heading,
+bump `version` in `Cargo.toml`, then push a tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+You can also create the tag from the **Releases** page (*Draft a new release* → new tag → *Publish*).
+The workflow fills in the notes if you leave them empty, then attaches the binaries a few minutes later.
+`docker.yml` publishes the matching `X.Y.Z`, `X.Y` and `latest` image tags.
 
 **Mac signing (optional).** Add these repository secrets and the macOS workflow signs with your
 Developer ID using the hardened runtime, then notarizes and staples the disk image. Users then skip the
@@ -322,8 +330,8 @@ Gatekeeper step.
 | `APPLE_ID` · `APPLE_TEAM_ID` · `APPLE_APP_PASSWORD` | Notarization (an app-specific password from appleid.apple.com) |
 
 > [!NOTE]
-> GHCR makes a package private on its first push. Set it to **Public** once under
-> *Package settings → Change visibility* so Unraid and `docker pull` work without logging in.
+> If `docker pull ghcr.io/au12/nodal` asks you to log in (this happens with forks or private repos),
+> set the package to **Public** under *Package settings → Change visibility*.
 
 ## Roadmap
 

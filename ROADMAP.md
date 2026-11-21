@@ -34,7 +34,7 @@ plan will change as real use shows what matters. Ideas and requests are welcome 
 - [ ] **macOS integration.** Finder *Open With*, dropping onto the Dock icon, file associations for
       panoramas and tour folders, and a `nodal://` URL scheme
 - [ ] **Recent tours** list and a "reveal in Finder/Explorer" action on the native start screen
-- [ ] **Windows installer** (MSIX or MSI) with code signing
+- [ ] **Windows installer** (MSIX or MSI) with code signing, and a GUI build that opens without a console window
 - [ ] **Linux packages:** AppImage and Flatpak
 - [ ] **Unraid Community Applications** listing
 - [ ] **Faster image builds** with cargo-chef dependency caching
@@ -82,6 +82,7 @@ plan will change as real use shows what matters. Ideas and requests are welcome 
 - On macOS you can drop files onto the **window**, but dropping onto the Dock icon and Finder *Open With*
   aren't wired up yet.
 - The server has **one shared token**, with no per-user accounts yet.
+- On **Windows** the `.exe` is also the command-line tool, so a console window opens alongside the app.
 - Panoramas must be **stitched equirectangular** images (full or partial).
 
 ## Not planned
