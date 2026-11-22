@@ -184,6 +184,9 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
     if proj.output.exposure_compensation {
         proj.images.iter_mut().for_each(|i| i.gain = [1.0; 3]);
     }
+    if !proj.output.local_alignment {
+        proj.images.iter_mut().for_each(|i| i.warp = None);
+    }
 
     // ---- Reduced-size pass: exposure and seams -------------------------------------------
     progress(0.0, "Analysing overlaps");

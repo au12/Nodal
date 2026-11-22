@@ -50,6 +50,8 @@ pub struct AlignReport {
     /// Where each lens's starting field of view came from.
     pub lens_source: Vec<LensSource>,
     pub log: Vec<String>,
+    /// Result of the local alignment pass, when it ran.
+    pub local: Option<crate::local::LocalReport>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -595,6 +597,51 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
     report.control_points = project.control_points.len();
     progress(1.0, "Aligned");
     Ok(report)
+}
+
+/// Final optimisation pass after control points have been refined: tight robust threshold, all
+/// lens parameters the data supports, outliers dropped. Returns (RMS, max) in source pixels.
+pub fn polish(project: &mut Project, opts: &AlignOptions) -> (f64, f64) {
+    let n = project.images.len();
+    let anchor = (0..n).find(|&i| project.images[i].aligned).unwrap_or(0);
+    let mut fixed = vec![false; n];
+    fixed[anchor] = true;
+    for (i, img) in project.images.iter().enumerate() {
+        if !img.aligned {
+            fixed[i] = true;
+        }
+    }
+    let fov_prior: Vec<Option<(f64, f64)>> = project.lenses.iter().map(|l| Some((l.hfov, (l.hfov * 0.02).max(0.2)))).collect();
+    let per_lens = project.control_points.len() / project.lenses.len().max(1);
+    let user_lens = opts.lens.is_some();
+    let flags = if opts.optimize_lens && per_lens >= 30 {
+        LensFlags { fov: !user_lens, a: per_lens >= 80, b: true, c: per_lens >= 80, shift: per_lens >= 150 }
+    } else {
+        LensFlags::NONE
+    };
+    for round in 0..3 {
+        let backup = project.clone();
+        let cps = project.control_points.clone();
+        // Robust scale from the data itself.
+        optimize::update_errors(project);
+        let med = median(project.control_points.iter().map(|c| c.error).collect()).max(0.15) as f64;
+        optimize::optimize(
+            project,
+            &cps,
+            &OptOptions { flags, huber_px: 2.5 * med, max_iters: 60, fov_prior: fov_prior.clone(), fixed: fixed.clone() },
+        );
+        let sane = project.lenses.iter().all(|l| l.hfov.is_finite() && l.hfov > 1.0 && (l.a.abs() + l.b.abs() + l.c.abs()) < 0.9);
+        if !sane {
+            *project = backup;
+            break;
+        }
+        if round < 2 && prune(project, 0.6, 4.0) == 0 {
+            break;
+        }
+    }
+    optimize::update_errors(project);
+    let lens_idx: Vec<usize> = project.images.iter().map(|i| i.lens).collect();
+    optimize::error_stats(project, &project.control_points, &lens_idx)
 }
 
 /// Replaces the control points with a denser set found by geometry-guided matching.
