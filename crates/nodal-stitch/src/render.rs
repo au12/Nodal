@@ -41,6 +41,8 @@ pub struct RenderStats {
     pub full_resolution_images: usize,
     /// Interior holes and pole gaps filled, in percent of the image.
     pub filled_percent: f32,
+    /// Reduced-canvas pixels dropped as ghosts (moving people, shadows).
+    pub ghost_pixels: usize,
     pub bands: usize,
     pub seam_pairs: usize,
     /// (stage, seconds)
@@ -190,6 +192,167 @@ fn padded_intervals(roi: &Roi, canvas_w: usize, pad: usize, align: usize) -> Vec
     merged
 }
 
+/// Ghost masks: where at least three photos overlap and one of them disagrees clearly with the
+/// others (a person who moved, the photographer's shadow, a passing car), that photo's pixels are
+/// marked so seams avoid them and blending ignores them. Works on reduced-size layers in
+/// perceptual units (0–255), on blurred luminance so texture misalignment does not count.
+/// Returns one ROI-local mask per layer (true = ghost).
+pub fn ghost_masks(layers: &[Layer], cw: usize, ch: usize) -> Vec<Vec<bool>> {
+    const K: usize = 12;
+    const THRESHOLD: f32 = 20.0;
+    // Blurred luminance per layer (5×5 box over covered pixels).
+    let lumas: Vec<Vec<f32>> = layers
+        .par_iter()
+        .map(|l| {
+            let (w, h) = (l.roi.w, l.roi.h);
+            let y: Vec<f32> = (0..w * h).map(|i| 0.3 * l.rgb[i * 3] + 0.59 * l.rgb[i * 3 + 1] + 0.11 * l.rgb[i * 3 + 2]).collect();
+            let mut out = vec![f32::NAN; w * h];
+            for py in 0..h {
+                for px in 0..w {
+                    if l.alpha[py * w + px] == 0 {
+                        continue;
+                    }
+                    let (mut s, mut n) = (0.0f32, 0.0f32);
+                    for dy in -2i32..=2 {
+                        let yy = py as i32 + dy;
+                        if yy < 0 || yy >= h as i32 {
+                            continue;
+                        }
+                        for dx in -2i32..=2 {
+                            let xx = px as i32 + dx;
+                            if xx < 0 || xx >= w as i32 {
+                                continue;
+                            }
+                            let j = yy as usize * w + xx as usize;
+                            if l.alpha[j] != 0 {
+                                s += y[j];
+                                n += 1.0;
+                            }
+                        }
+                    }
+                    out[py * w + px] = s / n;
+                }
+            }
+            out
+        })
+        .collect();
+    // Gather the values every layer has at each canvas pixel.
+    let mut count = vec![0u8; cw * ch];
+    let mut vals = vec![0.0f32; cw * ch * K];
+    let mut owners = vec![0u16; cw * ch * K];
+    for (k, l) in layers.iter().enumerate() {
+        let roi = l.roi;
+        for ly in 0..roi.h {
+            let cy = roi.y0 + ly as i64;
+            if cy < 0 || cy >= ch as i64 {
+                continue;
+            }
+            for lx in 0..roi.w {
+                let v = lumas[k][ly * roi.w + lx];
+                if v.is_nan() {
+                    continue;
+                }
+                let cx = (roi.x0 + lx as i64).rem_euclid(cw as i64) as usize;
+                let c = cy as usize * cw + cx;
+                let n = count[c] as usize;
+                if n < K {
+                    vals[c * K + n] = v;
+                    owners[c * K + n] = k as u16;
+                    count[c] += 1;
+                }
+            }
+        }
+    }
+    // Flag outliers against the median.
+    let mut flags: Vec<Vec<bool>> = layers.iter().map(|l| vec![false; l.roi.w * l.roi.h]).collect();
+    let mut flagged_any = false;
+    for c in 0..cw * ch {
+        let n = count[c] as usize;
+        if n < 3 {
+            continue;
+        }
+        let mut v: Vec<f32> = vals[c * K..c * K + n].to_vec();
+        v.sort_by(|a, b| a.total_cmp(b));
+        let med = v[n / 2];
+        let mut out = Vec::new();
+        let mut best = (f32::MAX, 0usize);
+        for t in 0..n {
+            let d = (vals[c * K + t] - med).abs();
+            if d < best.0 {
+                best = (d, t);
+            }
+            if d > THRESHOLD {
+                out.push(t);
+            }
+        }
+        if out.len() == n {
+            out.retain(|&t| t != best.1);
+        }
+        let (cx, cy) = (c % cw, c / cw);
+        for t in out {
+            let k = owners[c * K + t] as usize;
+            if let Some(i) = layers[k].index(cx, cy, cw) {
+                flags[k][i] = true;
+                flagged_any = true;
+            }
+        }
+    }
+    if !flagged_any {
+        return flags;
+    }
+    // Clean up: drop isolated flags, then grow a little to cover soft edges.
+    flags
+        .par_iter()
+        .zip(layers.par_iter())
+        .map(|(f, l)| {
+            let (w, h) = (l.roi.w, l.roi.h);
+            let at = |m: &[bool], x: i32, y: i32| x >= 0 && y >= 0 && x < w as i32 && y < h as i32 && m[y as usize * w + x as usize];
+            let mut opened = vec![false; w * h];
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    if !at(f, x, y) {
+                        continue;
+                    }
+                    let mut n = 0;
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            n += at(f, x + dx, y + dy) as i32;
+                        }
+                    }
+                    opened[y as usize * w + x as usize] = n >= 5;
+                }
+            }
+            let mut grown = vec![false; w * h];
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let mut any = false;
+                    'n: for dy in -2..=2 {
+                        for dx in -2..=2 {
+                            if at(&opened, x + dx, y + dy) {
+                                any = true;
+                                break 'n;
+                            }
+                        }
+                    }
+                    grown[y as usize * w + x as usize] = any && l.alpha[y as usize * w + x as usize] != 0;
+                }
+            }
+            grown
+        })
+        .collect()
+}
+
+/// Applies ghost masks to layers (the photo no longer covers those pixels).
+fn mask_ghosts(layers: &mut [Layer], ghosts: &[Vec<bool>]) {
+    for (l, g) in layers.iter_mut().zip(ghosts) {
+        for (i, &gh) in g.iter().enumerate() {
+            if gh {
+                l.alpha[i] = 0;
+            }
+        }
+    }
+}
+
 /// Render-time copy of the project with the output switches applied.
 fn prepared(project: &Project) -> Project {
     let mut proj = project.clone();
@@ -251,8 +414,17 @@ pub fn render(project: &Project, pixels: &dyn PixelProvider, opts: &RenderOption
         perceptual_255(&mut layer);
         layer
     };
-    let low_layers: Vec<Layer> = active.par_iter().map(|&i| low_layer(&low, i)).collect();
+    let mut low_layers: Vec<Layer> = active.par_iter().map(|&i| low_layer(&low, i)).collect();
     lap(&mut stats, "preview warp");
+    // Moving people and shadows: drop the photos that disagree with the consensus.
+    let ghosts: Vec<(Roi, Vec<bool>)> = if proj.output.seam_optimization && active.len() > 2 {
+        let g = ghost_masks(&low_layers, lw, lh);
+        mask_ghosts(&mut low_layers, &g);
+        low_layers.iter().map(|l| l.roi).zip(g).collect()
+    } else {
+        Vec::new()
+    };
+    stats.ghost_pixels = ghosts.iter().map(|(_, g)| g.iter().filter(|x| **x).count()).sum();
 
     progress(0.12, "Placing seams");
     let mut labels = seam::initial_labels(lw, lh, &low_layers);
@@ -260,7 +432,26 @@ pub fn render(project: &Project, pixels: &dyn PixelProvider, opts: &RenderOption
         // Coarse-to-fine: solve the seams freely on a quarter-size canvas, then polish them in a
         // narrow band at the working size.
         let coarse = Canvas::equirect((lw / 4 / 2 * 2).max(32));
-        let coarse_layers: Vec<Layer> = active.par_iter().map(|&i| low_layer(&coarse, i)).collect();
+        let mut coarse_layers: Vec<Layer> = active.par_iter().map(|&i| low_layer(&coarse, i)).collect();
+        if !ghosts.is_empty() {
+            // Carry the ghost masks down to the coarse canvas.
+            let f = lw as f64 / coarse.w as f64;
+            for (k, layer) in coarse_layers.iter_mut().enumerate() {
+                let (groi, gm) = &ghosts[k];
+                let roi = layer.roi;
+                for ly in 0..roi.h {
+                    for lx in 0..roi.w {
+                        let cx = ((roi.x0 + lx as i64) as f64 + 0.5) * f;
+                        let cy = ((roi.y0 + ly as i64) as f64 + 0.5) * f;
+                        let gx = (cx as i64 - groi.x0).rem_euclid(lw as i64) as usize;
+                        let gy = cy as i64 - groi.y0;
+                        if gy >= 0 && (gy as usize) < groi.h && gx < groi.w && gm[gy as usize * groi.w + gx] {
+                            layer.alpha[ly * roi.w + lx] = 0;
+                        }
+                    }
+                }
+            }
+        }
         let mut coarse_labels = seam::initial_labels(coarse.w, coarse.h, &coarse_layers);
         stats.seam_pairs = seam::refine_seams(&mut coarse_labels, coarse.w, coarse.h, &coarse_layers, true, 3, coarse.w / 8);
         seam::upsample_labels(&coarse_labels, coarse.w, coarse.h, &mut labels, lw, lh, &low_layers);
@@ -409,8 +600,29 @@ pub fn render(project: &Project, pixels: &dyn PixelProvider, opts: &RenderOption
         }
         drop(current);
         next = prefetched;
-        for (bx0, by0, lw_px, lh_px, layer) in layers_done {
+        for (bx0, by0, lw_px, lh_px, mut layer) in layers_done {
             let t1 = Instant::now();
+            if let Some((groi, gm)) = ghosts.get(k) {
+                if gm.iter().any(|g| *g) {
+                    let roi = layer.roi;
+                    let f = lw as f64 / canvas.w as f64;
+                    layer.alpha.par_chunks_mut(roi.w).zip(layer.rgb.par_chunks_mut(roi.w * 3)).enumerate().for_each(|(ly, (arow, crow))| {
+                        let cy = ((roi.y0 + ly as i64) as f64 + 0.5) * f;
+                        let gy = cy as i64 - groi.y0;
+                        if gy < 0 || gy as usize >= groi.h {
+                            return;
+                        }
+                        for lx in 0..roi.w {
+                            let cx = ((roi.x0 + lx as i64) as f64 + 0.5) * f;
+                            let gx = (cx as i64 - groi.x0).rem_euclid(lw as i64) as usize;
+                            if gx < groi.w && gm[gy as usize * groi.w + gx] {
+                                arow[lx] = 0;
+                                crow[lx * 3..lx * 3 + 3].fill(0.0);
+                            }
+                        }
+                    });
+                }
+            }
             let mask = layer_mask(&layer, &canvas, &labels, lw, lh, k as u16);
             let alpha: Vec<f32> = layer.alpha.par_iter().map(|&a| if a > 0 { 1.0 } else { 0.0 }).collect();
             let t2 = Instant::now();

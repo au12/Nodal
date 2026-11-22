@@ -697,12 +697,15 @@ pub fn residual(project: &Project, m: &DenseMatch, with_warp: bool) -> f64 {
     crate::global::vec_angle(&da, &db) * ma.f
 }
 
+/// (RMS of the best 95 %, median, 90th percentile): a few gross mismatches (moving people,
+/// repetitive texture) should not dominate the figure.
 fn stats(mut v: Vec<f64>) -> (f64, f64, f64) {
     if v.is_empty() {
         return (0.0, 0.0, 0.0);
     }
     v.sort_by(|a, b| a.total_cmp(b));
-    let rms = (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
+    let keep = &v[..(v.len() * 95 / 100).max(1)];
+    let rms = (keep.iter().map(|x| x * x).sum::<f64>() / keep.len() as f64).sqrt();
     (rms, v[v.len() / 2], v[v.len() * 9 / 10])
 }
 
@@ -790,7 +793,7 @@ pub fn refine_project(project: &mut Project, sources: &[Source], opts: &AlignOpt
     report.median_after = med1;
     report.p90_after = p90_1;
     report.log.push(format!(
-        "Dense registration: {} pairs, {} measurements; misregistration RMS {:.2} → {:.2} px (median {:.2}, 90 % under {:.2})",
+        "Dense registration: {} pairs, {} measurements; misregistration (best 95 %) RMS {:.2} → {:.2} px (median {:.2}, 90 % under {:.2})",
         report.pairs, report.matches, rms0, rms1, med1, p90_1
     ));
     // Local warps for the parallax the global model cannot explain.
