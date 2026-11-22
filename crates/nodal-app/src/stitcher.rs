@@ -492,7 +492,7 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
                 s.preview_running = false;
                 if generation == s.preview_generation {
                     let mut rgba = Vec::with_capacity(pano.width * pano.height * 4);
-                    for (p, a) in pano.rgb.chunks_exact(3).zip(&pano.alpha) {
+                    for (p, a) in pano.rgb.as_chunks::<3>().0.iter().zip(&pano.alpha) {
                         rgba.extend_from_slice(&[p[0], p[1], p[2], *a]);
                     }
                     let img = egui::ColorImage::from_rgba_unmultiplied([pano.width, pano.height], &rgba);

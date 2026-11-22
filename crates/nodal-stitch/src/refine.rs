@@ -23,7 +23,7 @@ impl Luma {
         let (w, h) = (img.width() as usize, img.height() as usize);
         let mut data = vec![0u8; w * h];
         data.par_chunks_mut(w).zip(img.as_raw().par_chunks(w * 3)).for_each(|(o, row)| {
-            for (d, p) in o.iter_mut().zip(row.chunks_exact(3)) {
+            for (d, p) in o.iter_mut().zip(row.as_chunks::<3>().0) {
                 *d = ((77 * p[0] as u32 + 150 * p[1] as u32 + 29 * p[2] as u32) >> 8) as u8;
             }
         });

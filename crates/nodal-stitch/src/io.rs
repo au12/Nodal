@@ -132,7 +132,7 @@ pub fn save_panorama(pano: &crate::render::Panorama, path: &Path, quality: u8) -
         "png" | "tif" | "tiff" => {
             if pano.has_gaps() {
                 let mut rgba = Vec::with_capacity(pano.width * pano.height * 4);
-                for (p, a) in pano.rgb.chunks_exact(3).zip(&pano.alpha) {
+                for (p, a) in pano.rgb.as_chunks::<3>().0.iter().zip(&pano.alpha) {
                     rgba.extend_from_slice(&[p[0], p[1], p[2], *a]);
                 }
                 image::RgbaImage::from_raw(pano.width as u32, pano.height as u32, rgba).context("buffer size")?.save(path)?;

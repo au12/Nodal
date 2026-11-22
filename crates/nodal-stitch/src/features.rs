@@ -47,7 +47,7 @@ impl Gray {
                 let mut sum = 0u32;
                 for y in y0..y1 {
                     let line = &rgb[(y * w + x0) * 3..(y * w + x1) * 3];
-                    for px in line.chunks_exact(3) {
+                    for px in line.as_chunks::<3>().0 {
                         // Rec. 601 luma in 8.8 fixed point.
                         sum += 77 * px[0] as u32 + 150 * px[1] as u32 + 29 * px[2] as u32;
                     }
