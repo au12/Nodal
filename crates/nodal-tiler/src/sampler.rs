@@ -47,6 +47,31 @@ impl Coverage {
         self.hfov >= 2.0 * PI - 1e-4 && self.vfov >= PI - 1e-4
     }
 
+    /// Reads Photo Sphere (GPano) metadata from an image file's bytes, if present: it records which
+    /// part of the full sphere a cropped panorama covers. Nodal's stitcher and most panorama tools
+    /// write it.
+    pub fn from_gpano(bytes: &[u8]) -> Option<Coverage> {
+        // The XMP packet sits in the file header; attribute and element forms are both common.
+        let head = &bytes[..bytes.len().min(256 * 1024)];
+        let text = String::from_utf8_lossy(head);
+        let field = |name: &str| -> Option<f32> {
+            let key = format!("GPano:{name}");
+            let at = text.find(&key)? + key.len();
+            let rest = &text[at..];
+            let rest = rest.trim_start_matches(|c: char| c == '=' || c == '"' || c == '\'' || c == '>' || c.is_whitespace());
+            let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        };
+        let (full_w, full_h) = (field("FullPanoWidthPixels")?, field("FullPanoHeightPixels")?);
+        let (w, h) = (field("CroppedAreaImageWidthPixels")?, field("CroppedAreaImageHeightPixels")?);
+        let top = field("CroppedAreaTopPixels").unwrap_or(0.0);
+        if full_w < 1.0 || full_h < 1.0 || w < 1.0 || h < 1.0 || w > full_w + 0.5 || h + top > full_h + 0.5 {
+            return None;
+        }
+        let centre = (top + h * 0.5) / full_h;
+        Some(Coverage { hfov: (w / full_w * 2.0 * PI).min(2.0 * PI), vfov: (h / full_h * PI).min(PI), voffset: (0.5 - centre) * PI })
+    }
+
     /// Guesses coverage from the aspect ratio: 2:1 is a full sphere, wider images are
     /// treated as 360° panoramas with a reduced vertical field centred on the horizon.
     pub fn guess(width: u32, height: u32) -> Coverage {
@@ -274,6 +299,16 @@ pub fn to_u8(c: [f32; 3]) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpano_metadata_gives_coverage() {
+        let xmp = br#"....<rdf:Description GPano:ProjectionType="equirectangular" GPano:CroppedAreaImageWidthPixels="4000" GPano:CroppedAreaImageHeightPixels="1000" GPano:FullPanoWidthPixels="8000" GPano:FullPanoHeightPixels="4000" GPano:CroppedAreaLeftPixels="2000" GPano:CroppedAreaTopPixels="1000"/>"#;
+        let c = Coverage::from_gpano(xmp).unwrap();
+        assert!((c.hfov.to_degrees() - 180.0).abs() < 1e-3);
+        assert!((c.vfov.to_degrees() - 45.0).abs() < 1e-3);
+        assert!((c.voffset.to_degrees() - 22.5).abs() < 1e-3); // centred above the horizon
+        assert!(Coverage::from_gpano(b"no metadata here").is_none());
+    }
 
     #[test]
     fn fast_atan2_is_accurate() {

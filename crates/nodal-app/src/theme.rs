@@ -34,6 +34,12 @@ pub fn glass_frame() -> Frame {
     Frame::new().fill(glass()).stroke(hairline()).corner_radius(CornerRadius::same(16)).inner_margin(Margin::same(10)).shadow(shadow())
 }
 
+/// An inset card for read-outs inside side panels.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // only the native stitching workspace uses it so far
+pub fn card_frame() -> Frame {
+    Frame::new().fill(Color32::from_rgb(27, 30, 36)).stroke(hairline()).corner_radius(CornerRadius::same(10)).inner_margin(Margin::same(10))
+}
+
 pub fn heading_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("semibold".into()))
 }

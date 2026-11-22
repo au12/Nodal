@@ -143,12 +143,17 @@ fn native_body(app: &mut NodalApp, ui: &mut Ui, width: f32) {
         let r = ui.max_rect().expand(14.0);
         dashed_rect(ui, r, if hovering_files { theme::ACCENT } else { Color32::from_white_alpha(40) });
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("Drop panoramas or a tour folder here").font(theme::heading_font(18.0)));
-            ui.label(RichText::new("Equirectangular JPG, PNG, TIFF or WebP — tiled on all cores, ready in seconds.").color(theme::MUTED));
+            ui.label(RichText::new("Drop photos, panoramas or a tour folder here").font(theme::heading_font(18.0)));
+            ui.label(
+                RichText::new("Overlapping photos are stitched into a panorama; finished panoramas become a tour.").color(theme::MUTED),
+            );
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                icons::center_row(ui, &["New tour from panoramas…", "Open tour…"]);
-                if icons::pill(ui, Icon::Plus, "New tour from panoramas…", true).clicked() {
+                icons::center_row(ui, &["Stitch photos…", "New tour from panoramas…", "Open tour…"]);
+                if icons::pill(ui, Icon::Area, "Stitch photos…", true).clicked() {
+                    crate::stitcher::open(app, Vec::new());
+                }
+                if icons::pill(ui, Icon::Plus, "New tour from panoramas…", false).clicked() {
                     if let Some(files) =
                         rfd::FileDialog::new().add_filter("Panoramas", &["jpg", "jpeg", "png", "tif", "tiff", "webp"]).pick_files()
                     {
@@ -304,6 +309,11 @@ fn is_image(p: &std::path::Path) -> bool {
 pub fn open_paths(app: &mut NodalApp, paths: Vec<std::path::PathBuf>) {
     use crate::loader::Origin;
     let images: Vec<_> = paths.iter().filter(|p| is_image(p)).cloned().collect();
+    // Several photos that are not finished 2:1 panoramas are a set to stitch.
+    if images.len() >= 2 && !crate::stitcher::all_panoramas(&images) {
+        crate::stitcher::open(app, images);
+        return;
+    }
     if !images.is_empty() {
         // Add to the open editable tour, or start a new one.
         if let (crate::app::Screen::Viewer, Some(Origin::Local(dir))) = (app.screen, app.tour.as_ref().map(|t| t.origin.clone())) {

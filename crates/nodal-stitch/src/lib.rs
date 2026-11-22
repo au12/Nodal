@@ -26,6 +26,7 @@ pub mod warp;
 
 pub use align::{AlignOptions, AlignReport};
 pub use lens::{Lens, LensKind};
+pub use nalgebra;
 pub use project::{ControlPoint, OutputSettings, Project, SourceImage};
 pub use render::{render, Panorama, RenderOptions};
 

@@ -9,13 +9,15 @@ work can resume from a cold start.
 ## Milestones
 1. [x] `nodal-stitch` alignment: EXIF, lens models, SIFT features, matching, RANSAC, bundle adjustment,
    levelling, synthetic ground-truth tests
-2. [~] Render: tiled warp, exposure/WB compensation, graph-cut seams, multi-band blending, output + XMP
-   done; `nodal stitch` CLI and performance tuning (warp+blend ~3 MP/s on 2 cores) still to do
-3. [ ] Local alignment: guided matching, smooth per-image warp fields
+2. [x] Render: tiled warp, exposure/WB compensation, graph-cut seams, multi-band blending, output + XMP,
+   `nodal stitch` CLI. Possible speed-up left: tight full-res ROI + wide low-res context per layer
+3. [x] Local alignment: guided matching, sub-pixel refinement (`refine.rs`), warp fields (`local.rs`)
 4. [x] Pole patching (`fill.rs`): thin-plate base + coherent multi-scale PatchMatch in a pole view,
    full-res re-sampling. Known weak case: complex man-made structure overhead (station roofs)
 5. [ ] GPU: live stitch preview shader, GPU warp path
-6. [ ] App: unified UI, stitch workspace, project files, send-to-tour
+6. [~] App: stitch workspace (`nodal-app/src/stitcher.rs`) with live preview, lens/alignment/output
+   panels, Save panorama and Create tour. Still to do: project save/open, mask painting, circular
+   fisheye crop detection, server-side stitching for the Docker image
 7. [ ] Docs, screenshots, changelog, version 0.2.0
 
 ## Conventions
