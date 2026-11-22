@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nodal-core", "crates/nodal-tiler", "crates/nodal-render", "crates/nodal-app", "crates/nodal-server"]
+members = ["crates/nodal-core", "crates/nodal-tiler", "crates/nodal-stitch", "crates/nodal-render", "crates/nodal-app", "crates/nodal-server"]
 
 [workspace.package]
 version = "0.1.0"
