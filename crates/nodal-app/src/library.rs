@@ -308,6 +308,13 @@ fn is_image(p: &std::path::Path) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_paths(app: &mut NodalApp, paths: Vec<std::path::PathBuf>) {
     use crate::loader::Origin;
+    // A saved stitching project.
+    if let Some(project) = paths.iter().find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("nodal"))) {
+        if let Err(e) = crate::stitcher::open_project(app, project) {
+            app.loader.report(crate::loader::Event::Error(e));
+        }
+        return;
+    }
     let images: Vec<_> = paths.iter().filter(|p| is_image(p)).cloned().collect();
     // Several photos that are not finished 2:1 panoramas are a set to stitch.
     if images.len() >= 2 && !crate::stitcher::all_panoramas(&images) {

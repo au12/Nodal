@@ -106,6 +106,7 @@ Tagged releases include `nodal` archives for Linux (x86_64, arm64) and Windows (
 ```sh
 nodal                          # start screen: drop photos, panoramas or a tour folder
 nodal IMG_01.jpg IMG_02.jpg …  # overlapping photos open in the stitching workspace
+nodal holiday.nodal             # reopens a saved stitching project
 nodal ~/Pictures/pano.jpg      # a finished 2:1 panorama is tiled into a new tour and opened
 nodal path/to/tour             # opens an existing tour
 ```
@@ -148,6 +149,8 @@ Stitching is fully automatic, and every step can be inspected or overridden in t
   While you drag, the preview is re-projected live on the GPU.
 - **Output.** JPEG, PNG or TIFF at the photos' native resolution or any size, with Photo Sphere
   (GPano) metadata. Partial panoramas are trimmed to a clean rectangle. One click builds a tour.
+- **Projects.** Save a stitch as a `.nodal` file and reopen it later with its alignment, lens and
+  settings intact.
 
 ![Nadir gap before and after patching](docs/screenshots/pole-patch.jpg)
 

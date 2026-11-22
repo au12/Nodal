@@ -117,6 +117,8 @@ pub struct Stitcher {
     grid: bool,
     /// Photos waiting to be loaded once a frame (and its context) is available.
     pending: Vec<PathBuf>,
+    /// A saved project waiting for its photos to finish loading.
+    pending_project: Option<Project>,
     /// The GPU preview's photo textures need (re)uploading.
     gpu_dirty: bool,
     gpu_ready: bool,
@@ -161,6 +163,7 @@ impl Default for Stitcher {
             show_points: false,
             grid: false,
             pending: Vec::new(),
+            pending_project: None,
             gpu_dirty: false,
             gpu_ready: false,
             gains: Vec::new(),
@@ -201,7 +204,10 @@ impl Stitcher {
     pub fn add_photos(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         let mut paths: Vec<PathBuf> = paths.into_iter().filter(|p| is_photo(p)).collect();
         paths.retain(|p| !self.sources.iter().any(|s| s.path == *p));
-        paths.sort();
+        // A reopened project keeps its saved photo order.
+        if self.pending_project.is_none() {
+            paths.sort();
+        }
         if paths.is_empty() || self.busy() {
             return;
         }
@@ -472,7 +478,18 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
                 s.report = None;
                 s.preview = None;
                 s.saved = None;
-                if s.sources.len() >= 2 {
+                // A reopened project brings its own alignment, as long as the photos still match.
+                let restored = s.pending_project.take().filter(|p| {
+                    p.images.len() == s.sources.len()
+                        && p.images
+                            .iter()
+                            .zip(&s.sources)
+                            .all(|(img, src)| img.path == src.path && img.width == src.image.width() && img.height == src.image.height())
+                });
+                if let Some(project) = restored {
+                    s.project = Some(project);
+                    s.request_preview(ctx);
+                } else if s.sources.len() >= 2 {
                     s.align(ctx);
                 }
             }
@@ -544,6 +561,32 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
             }
         }
     }
+}
+
+/// Reopens a saved stitching project (`.nodal`): loads its photos and restores the alignment.
+pub fn open_project(app: &mut NodalApp, path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    let mut project = Project::from_json(&text).map_err(|e| format!("{} is not a Nodal stitching project: {e:#}", path.display()))?;
+    let base = path.parent().unwrap_or(Path::new("."));
+    for img in &mut project.images {
+        // Photos saved next to the project may have moved with it.
+        if !img.path.exists() {
+            if let Some(name) = img.path.file_name() {
+                let local = base.join(name);
+                if local.exists() {
+                    img.path = local;
+                }
+            }
+        }
+        if !img.path.exists() {
+            return Err(format!("A photo of this project is missing: {}", img.path.display()));
+        }
+    }
+    app.stitcher.reset();
+    app.screen = Screen::Stitch;
+    app.stitcher.pending = project.images.iter().map(|i| i.path.clone()).collect();
+    app.stitcher.pending_project = Some(project);
+    Ok(())
 }
 
 /// Opens the workspace, adding these photos (possibly none) to it.
@@ -701,6 +744,24 @@ fn top_bar(app: &mut NodalApp, ui: &mut Ui) {
                                 app.stitcher.export(ui.ctx(), path, false);
                             }
                         }
+                        if ui.button("Save project…").on_hover_text("Keep the alignment, lens and settings to continue later").clicked() {
+                            let mut dialog = rfd::FileDialog::new()
+                                .set_title("Save stitching project")
+                                .set_file_name(format!("{}.nodal", app.stitcher.default_name()))
+                                .add_filter("Nodal project", &["nodal"]);
+                            if let Some(dir) = app.stitcher.sources.first().and_then(|s| s.path.parent()) {
+                                dialog = dialog.set_directory(dir);
+                            }
+                            if let (Some(mut path), Some(project)) = (dialog.save_file(), app.stitcher.project.as_ref()) {
+                                if path.extension().is_none() {
+                                    path.set_extension("nodal");
+                                }
+                                match std::fs::write(&path, project.to_json()) {
+                                    Ok(()) => app.toast(ui.ctx(), "Project saved", false),
+                                    Err(e) => app.stitcher.error = Some(format!("Could not save the project: {e}")),
+                                }
+                            }
+                        }
                     });
                 });
             });
@@ -856,7 +917,8 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
 
                 // ---- Alignment ----
                 section(ui, "Alignment");
-                if let (Some(p), Some(r)) = (&s.project, &s.report) {
+                if let Some(p) = &s.project {
+                    let r = s.report.as_ref();
                     let rms = p.control_points.iter().map(|c| (c.error as f64).powi(2)).sum::<f64>() / p.control_points.len().max(1) as f64;
                     let rms = rms.sqrt();
                     let (verdict, colour) = if rms < 1.0 {
@@ -873,23 +935,24 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(verdict).font(theme::heading_font(15.0)).color(colour));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{:.1} s", s.align_secs)).color(theme::MUTED).small());
+                                if r.is_some() {
+                                    ui.label(RichText::new(format!("{:.1} s", s.align_secs)).color(theme::MUTED).small());
+                                }
                             });
                         });
-                        stat(ui, "Control points", format!("{} in {} pairs", p.control_points.len(), r.pairs.len()));
+                        let pairs: std::collections::HashSet<(u32, u32)> = p.control_points.iter().map(|c| (c.a, c.b)).collect();
+                        stat(ui, "Control points", format!("{} in {} pairs", p.control_points.len(), pairs.len()));
                         stat(ui, "Average distance", format!("{rms:.2} px"));
-                        if let Some(local) = r.local.filter(|l| l.images_warped > 0 && p.output.local_alignment) {
+                        if let Some(local) = r.and_then(|r| r.local).filter(|l| l.images_warped > 0 && p.output.local_alignment) {
                             stat(ui, "After local alignment", format!("{:.2} px", local.after));
                         }
                     });
-                    if !r.unaligned.is_empty() {
+                    let unaligned = p.images.iter().filter(|i| !i.aligned).count();
+                    if unaligned > 0 {
                         ui.label(
-                            RichText::new(format!(
-                                "{} photo(s) could not be placed: they need more overlap with the others.",
-                                r.unaligned.len()
-                            ))
-                            .color(theme::DANGER)
-                            .small(),
+                            RichText::new(format!("{unaligned} photo(s) could not be placed: they need more overlap with the others."))
+                                .color(theme::DANGER)
+                                .small(),
                         );
                     }
                     ui.horizontal(|ui| {

@@ -18,6 +18,7 @@ Nodal now stitches. Drop in overlapping photos and get a finished panorama or to
 - **Pole patching.** Zenith and nadir gaps are filled automatically, and a nadir patch can paint out a tripod
 - **Stitching workspace** in the native app: photo list, lens and alignment read-outs, control point table, output settings, *Save panorama* and *Create tour*
 - **GPU live preview.** The panorama is re-projected on the GPU while you drag to re-centre or level it
+- **Project files** (`.nodal`). Save a stitch from the app or with `--project`, and reopen it later with its alignment intact
 - **`nodal stitch`** command, with `--tour` to go from photos to a tour in one step
 - Panoramas are saved with Photo Sphere (GPano) metadata, and the tiler reads it, so partial panoramas keep their true field of view in tours
 - Partial panoramas are trimmed to a clean rectangle
