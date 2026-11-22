@@ -59,6 +59,8 @@ pub struct AlignReport {
     pub dense: Option<crate::dense::DenseReport>,
     /// Exposure, white balance and vignetting calibration.
     pub photometric: Option<crate::photometric::PhotoReport>,
+    /// (stage, seconds)
+    pub timings: Vec<(String, f32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

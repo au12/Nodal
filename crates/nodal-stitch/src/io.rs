@@ -131,10 +131,128 @@ pub fn encode_jpeg(pano: &crate::render::Panorama, quality: u8) -> Result<Vec<u8
     Ok(out)
 }
 
-/// ICC profile of the output colour space (sRGB).
+/// ICC profile of the output colour space: a standard ICC v2 sRGB display profile (D50 PCS,
+/// Bradford-adapted primaries, 1024-entry tone curves), built here so every reader (Photoshop,
+/// libpng, ImageIO) accepts it.
 pub fn srgb_icc() -> Vec<u8> {
     static ICC: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    ICC.get_or_init(|| moxcms::ColorProfile::new_srgb().encode().unwrap_or_default()).clone()
+    ICC.get_or_init(build_srgb_icc).clone()
+}
+
+fn build_srgb_icc() -> Vec<u8> {
+    fn s15(v: f64) -> [u8; 4] {
+        ((v * 65536.0).round() as i32).to_be_bytes()
+    }
+    fn xyz(x: f64, y: f64, z: f64) -> Vec<u8> {
+        let mut t = b"XYZ \0\0\0\0".to_vec();
+        t.extend_from_slice(&s15(x));
+        t.extend_from_slice(&s15(y));
+        t.extend_from_slice(&s15(z));
+        t
+    }
+    let desc = {
+        let text = b"sRGB IEC61966-2.1 (Nodal)\0";
+        let mut t = b"desc\0\0\0\0".to_vec();
+        t.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        t.extend_from_slice(text);
+        t.extend_from_slice(&[0u8; 4 + 4 + 2 + 1 + 67]);
+        t
+    };
+    let cprt = {
+        let mut t = b"text\0\0\0\0".to_vec();
+        t.extend_from_slice(b"No copyright, use freely\0");
+        t
+    };
+    let curv = {
+        const N: usize = 1024;
+        let mut t = b"curv\0\0\0\0".to_vec();
+        t.extend_from_slice(&(N as u32).to_be_bytes());
+        for i in 0..N {
+            let v = crate::pixels::srgb_to_linear(i as f32 / (N - 1) as f32) as f64;
+            t.extend_from_slice(&((v * 65535.0).round().clamp(0.0, 65535.0) as u16).to_be_bytes());
+        }
+        t
+    };
+    // Tag data blocks; the three tone curves share one block.
+    let blocks: Vec<(&[u8; 4], Vec<u8>)> = vec![
+        (b"desc", desc),
+        (b"cprt", cprt),
+        (b"wtpt", xyz(0.9642, 1.0, 0.8249)),
+        (b"rXYZ", xyz(0.436066, 0.222488, 0.013916)),
+        (b"gXYZ", xyz(0.385147, 0.716873, 0.097076)),
+        (b"bXYZ", xyz(0.143066, 0.060608, 0.714096)),
+        (b"rTRC", curv),
+    ];
+    let n_tags = blocks.len() + 2;
+    let mut offset = 128 + 4 + 12 * n_tags;
+    let mut table = Vec::new();
+    let mut data = Vec::new();
+    let mut trc_at = (0u32, 0u32);
+    for (sig, block) in &blocks {
+        while (offset + data.len()) % 4 != 0 {
+            data.push(0);
+        }
+        let at = (offset + data.len()) as u32;
+        table.push((**sig, at, block.len() as u32));
+        if *sig == b"rTRC" {
+            trc_at = (at, block.len() as u32);
+        }
+        data.extend_from_slice(block);
+    }
+    table.push((*b"gTRC", trc_at.0, trc_at.1));
+    table.push((*b"bTRC", trc_at.0, trc_at.1));
+    while (offset + data.len()) % 4 != 0 {
+        data.push(0);
+    }
+    offset += data.len();
+    let size = offset as u32;
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(&[0u8; 4]); // CMM
+    out.extend_from_slice(&[0x02, 0x10, 0, 0]); // version 2.1
+    out.extend_from_slice(b"mntrRGB XYZ ");
+    for v in [2026u16, 1, 1, 0, 0, 0] {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out.extend_from_slice(b"acsp");
+    out.extend_from_slice(&[0u8; 4]); // platform
+    out.extend_from_slice(&[0u8; 4]); // flags
+    out.extend_from_slice(&[0u8; 8]); // manufacturer, model
+    out.extend_from_slice(&[0u8; 8]); // attributes
+    out.extend_from_slice(&0u32.to_be_bytes()); // intent: perceptual
+    out.extend_from_slice(&s15(0.9642));
+    out.extend_from_slice(&s15(1.0));
+    out.extend_from_slice(&s15(0.8249));
+    out.extend_from_slice(&[0u8; 4]); // creator
+    out.extend_from_slice(&[0u8; 16]); // profile ID
+    out.extend_from_slice(&[0u8; 28]); // reserved
+    debug_assert_eq!(out.len(), 128);
+    out.extend_from_slice(&(n_tags as u32).to_be_bytes());
+    for (sig, at, len) in &table {
+        out.extend_from_slice(sig);
+        out.extend_from_slice(&at.to_be_bytes());
+        out.extend_from_slice(&len.to_be_bytes());
+    }
+    out.extend_from_slice(&data);
+    debug_assert_eq!(out.len(), size as usize);
+    out
+}
+
+#[cfg(test)]
+mod icc_tests {
+    #[test]
+    fn srgb_profile_parses_and_round_trips() {
+        let icc = super::srgb_icc();
+        let p = moxcms::ColorProfile::new_from_slice(&icc).expect("valid ICC");
+        let dst = moxcms::ColorProfile::new_srgb();
+        let xf = p.create_transform_8bit(moxcms::Layout::Rgb, &dst, moxcms::Layout::Rgb, Default::default()).unwrap();
+        let src = [10u8, 128, 250, 0, 255, 77];
+        let mut out = [0u8; 6];
+        xf.transform(&src, &mut out).unwrap();
+        for (a, b) in src.iter().zip(&out) {
+            assert!((*a as i32 - *b as i32).abs() <= 2, "{src:?} -> {out:?}");
+        }
+    }
 }
 
 /// 16-bit samples, RGB or RGBA (alpha where the panorama has voids).
