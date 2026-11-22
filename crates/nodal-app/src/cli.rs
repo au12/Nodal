@@ -121,6 +121,15 @@ pub enum Command {
         #[arg(long)]
         title: Option<String>,
     },
+    /// Measure stitching speed on this machine with a built-in synthetic photo set.
+    Bench {
+        /// Megapixels per synthetic photo (8 fisheye photos covering the sphere).
+        #[arg(long, default_value_t = 12.0)]
+        megapixels: f32,
+        /// Width of the stitched panorama.
+        #[arg(long, default_value_t = 8000)]
+        width: u32,
+    },
 }
 
 /// Terminal progress: a live line on a TTY, one line per stage in logs.
@@ -329,6 +338,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                 println!("  tour with {} scene(s) → {}", t.scenes.len(), dir.join("tour.json").display());
             }
         }
+        Command::Bench { megapixels, width } => bench(megapixels, width)?,
         Command::Render { tour, scene, yaw, pitch, fov, projection, size, out } => {
             let json = tour_json(&tour);
             let t = Tour::from_json(&std::fs::read_to_string(&json)?)?;
@@ -398,5 +408,106 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Stitches a synthetic photo set with known ground truth and reports timings and accuracy.
+fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
+    use nodal_stitch::features::{detect, DetectOptions};
+    use nodal_stitch::project::{rotation_from_ypr, PoleFill};
+    use nodal_stitch::synth::{procedural_pano, render_shot, ShotOptions};
+    use nodal_stitch::{AlignOptions, Lens, LensKind, RenderOptions, Source};
+    use rayon::prelude::*;
+    use std::sync::Arc;
+
+    anyhow::ensure!((1.0..=64.0).contains(&megapixels), "--megapixels must be between 1 and 64");
+    anyhow::ensure!((1024..=32768).contains(&width), "--width must be between 1024 and 32768");
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    println!("Nodal {} benchmark", env!("CARGO_PKG_VERSION"));
+    println!("  machine: {} {}, {cores} cores", std::env::consts::OS, std::env::consts::ARCH);
+    match nodal_render::headless::Headless::new() {
+        Ok(h) => println!("  gpu: {}", h.adapter),
+        Err(e) => println!("  gpu: none ({e})"),
+    }
+
+    // Portrait 2:3 fisheye photos: six around, one up, one down, hand-held wobble included.
+    let sw = ((megapixels as f64 * 1e6 / 1.5).sqrt().round() as u32).max(400);
+    let sh = sw * 3 / 2;
+    let true_fov = 150.0;
+    let mut lens = Lens::new(LensKind::Fisheye, true_fov, sw, sh);
+    lens.b = -0.03;
+    lens.a = 0.01;
+    let poses = [
+        (0.0, 2.0, 1.0),
+        (61.0, -1.0, -2.0),
+        (119.0, 3.0, 0.5),
+        (182.0, 0.0, 1.5),
+        (240.0, -2.0, -1.0),
+        (301.0, 1.0, 0.0),
+        (10.0, 88.0, 0.0),
+        (30.0, -86.0, 5.0),
+    ];
+    eprintln!("  preparing {} synthetic photos of {sw}×{sh}…", poses.len());
+    // Source detail of about one panorama pixel per photo pixel.
+    let pano_w = ((sw as f64 * 360.0 / true_fov) as u32).clamp(4096, 16384).next_multiple_of(2);
+    let pano = procedural_pano(pano_w, 7);
+    let shots: Vec<Arc<image::RgbImage>> = poses
+        .par_iter()
+        .enumerate()
+        .map(|(i, &(y, p, r))| {
+            let opts = ShotOptions { gain: 1.0 + 0.15 * ((i % 3) as f32 - 1.0), vignette: 0.25, noise: 2.0, seed: i as u64 };
+            Arc::new(render_shot(&pano, &lens, &rotation_from_ypr(y, p, r), &opts))
+        })
+        .collect();
+    drop(pano);
+
+    let t0 = Instant::now();
+    let sources: Vec<Source> = shots
+        .par_iter()
+        .enumerate()
+        .map(|(i, s)| Source {
+            path: format!("bench{i}.jpg").into(),
+            image: s.clone(),
+            exif: Default::default(),
+            features: Arc::new(detect(s.as_raw(), s.width() as usize, s.height() as usize, &DetectOptions::default())),
+        })
+        .collect();
+    let t_features = t0.elapsed().as_secs_f32();
+
+    let t = Instant::now();
+    let (mut proj, report) = nodal_stitch::align_sources(&sources, &AlignOptions::default(), &|_, _| {})?;
+    let t_align = t.elapsed().as_secs_f32();
+    anyhow::ensure!(report.unaligned.is_empty(), "benchmark photos failed to align");
+
+    proj.output.width = width;
+    proj.output.pole_fill = PoleFill::Auto;
+    proj.output.nadir_patch = 20.0; // exercise the pole patcher too
+    let t = Instant::now();
+    let pano = nodal_stitch::render(&proj, &shots, &RenderOptions::default(), &|_, _| {})?;
+    let t_render = t.elapsed().as_secs_f32();
+
+    let total_mp = poses.len() as f32 * (sw * sh) as f32 / 1e6;
+    let out_mp = (pano.width * pano.height) as f32 / 1e6;
+    let est = proj.lenses[0];
+    println!("  input: {} photos × {:.1} MP = {total_mp:.0} MP", poses.len(), (sw * sh) as f32 / 1e6);
+    println!("  analyse (features):  {t_features:6.2} s   {:.0} MP/s", total_mp / t_features);
+    println!("  align + optimise:    {t_align:6.2} s   {} control points, RMS {:.2} px", report.control_points, report.rms);
+    println!(
+        "  render {}×{}:  {t_render:6.2} s   {:.1} MP/s, nadir patched: {}",
+        pano.width,
+        pano.height,
+        out_mp / t_render,
+        pano.stats.filled_nadir
+    );
+    for (stage, secs) in &pano.stats.timings {
+        println!("      {stage:<22} {secs:6.2} s");
+    }
+    println!("  total:               {:6.2} s", t_features + t_align + t_render);
+    println!(
+        "  accuracy: lens {} {:.2}° (true: fisheye {true_fov:.2}°), {} photos aligned",
+        est.kind.label().to_lowercase(),
+        est.hfov,
+        proj.images.iter().filter(|i| i.aligned).count()
+    );
     Ok(())
 }

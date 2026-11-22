@@ -367,6 +367,9 @@ pub fn side_panel(app: &mut NodalApp, ui: &mut Ui) {
                         ui.add(egui::Slider::new(&mut s.autorotate.speed, -20.0..=20.0).text("°/s"));
                         ui.add(egui::Slider::new(&mut s.autorotate.delay, 0.0..=60.0).text("s idle"));
                         ui.checkbox(&mut s.autorotate.level_horizon, "Level the horizon");
+                        ui.add(egui::Slider::new(&mut s.autorotate.max_seconds, 0.0..=600.0).text("s, then stop")).on_hover_text(
+                            "Rotation stops after this long without input, so an idle window stops using power. 0 = never stop.",
+                        );
                         section(ui, "Transitions");
                         egui::ComboBox::from_label("Style")
                             .width(180.0)

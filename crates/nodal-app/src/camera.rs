@@ -183,11 +183,12 @@ impl Camera {
         self.view = v;
     }
 
-    /// Advances the camera by `dt` seconds for a viewport of `w×h` physical pixels.
-    /// Returns true while anything is moving.
-    pub fn update(&mut self, dt: f32, w: f32, h: f32) -> bool {
+    /// Advances the camera by `dt` seconds for a viewport of `w×h` physical pixels. `real_dt` is the
+    /// wall-clock time since the previous frame (frames are not drawn while nothing changes), and
+    /// `active` is false when the window is in the background, where idle rotation is paused.
+    pub fn update(&mut self, dt: f32, real_dt: f32, active: bool, w: f32, h: f32) -> Motion {
         let dt = dt.clamp(0.0, 0.1);
-        self.idle += dt;
+        self.idle += real_dt.max(0.0);
 
         if let Some(anim) = &mut self.anim {
             anim.t += dt / anim.duration;
@@ -205,7 +206,7 @@ impl Camera {
                 self.anim = None;
             }
             self.view.yaw = wrap_180(self.view.yaw);
-            return true;
+            return Motion::Moving;
         }
 
         // Joystick drag: offset from the press point sets the angular velocity.
@@ -260,8 +261,7 @@ impl Camera {
         }
 
         // Autorotation after a period of inactivity, ramping in gently.
-        let rotating =
-            self.autorotate.enabled && self.autorotate_on && !self.dragging && self.idle > self.autorotate.delay && self.vel == Vec2::ZERO;
+        let rotating = active && self.autorotate_due() && !self.dragging && self.vel == Vec2::ZERO;
         if rotating {
             self.ramp = (self.ramp + dt / 1.8).min(1.0);
             let r = ease_in_out_cubic(self.ramp);
@@ -272,6 +272,41 @@ impl Camera {
             }
         }
         self.clamp();
-        rotating || self.is_animating()
+        if self.is_animating() {
+            Motion::Moving
+        } else if rotating {
+            Motion::AutoRotating
+        } else {
+            Motion::Still
+        }
     }
+
+    /// Whether idle rotation should be running right now (ignoring window state).
+    fn autorotate_due(&self) -> bool {
+        let a = &self.autorotate;
+        a.enabled && self.autorotate_on && self.idle > a.delay && (a.max_seconds <= 0.0 || self.idle < a.delay + a.max_seconds)
+    }
+
+    /// Seconds until idle rotation would start, if it is waiting to.
+    pub fn autorotate_starts_in(&self) -> Option<f32> {
+        let a = &self.autorotate;
+        (a.enabled && self.autorotate_on && self.idle <= a.delay).then_some(a.delay - self.idle)
+    }
+
+    /// Starts idle rotation now (or cancels the wait when turned off).
+    pub fn set_autorotate(&mut self, on: bool) {
+        self.autorotate_on = on;
+        self.idle = if on { self.autorotate.delay } else { 0.0 };
+    }
+}
+
+/// What the camera is doing, which decides how often the view must be redrawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion {
+    /// Nothing changes: no frames are needed.
+    Still,
+    /// Slow idle rotation: a reduced frame rate is plenty.
+    AutoRotating,
+    /// The user is steering, or an animation is running: full frame rate.
+    Moving,
 }

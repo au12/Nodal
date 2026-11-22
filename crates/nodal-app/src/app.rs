@@ -1,6 +1,6 @@
 //! The Nodal application: tour state, streaming, camera, transitions and input.
 
-use crate::camera::Camera;
+use crate::camera::{Camera, Motion};
 use crate::editor::Editor;
 use crate::hotspots::{self, DrawState, ScreenMap};
 use crate::library::Library;
@@ -112,6 +112,12 @@ pub struct NodalApp {
     pub last_proj: Option<Projector>,
     pub last_map: Option<ScreenMap>,
     hash_timer: f32,
+    /// Time of the previous viewer frame, for wall-clock idle tracking.
+    last_frame_time: f64,
+    pub motion: Motion,
+    /// Frames drawn in the current and the last full second (shown in the stats overlay).
+    frame_count: (f64, u32),
+    pub frames_last_second: u32,
     last_hash: String,
     pub initial_view: Option<(String, View)>,
     pub static_mode: bool,
@@ -202,6 +208,10 @@ impl NodalApp {
             last_proj: None,
             last_map: None,
             hash_timer: 0.0,
+            last_frame_time: 0.0,
+            motion: Motion::Still,
+            frame_count: (0.0, 0),
+            frames_last_second: 0,
             last_hash: String::new(),
             initial_view: None,
             static_mode: false,
@@ -522,7 +532,17 @@ impl NodalApp {
         if !ctx.egui_wants_keyboard_input() {
             self.keyboard_input(&ctx);
         }
-        let moving = self.camera.update(dt, w, h);
+        // Wall-clock time since the last frame, and whether anyone can see the window.
+        let real_dt = if self.last_frame_time > 0.0 { (now - self.last_frame_time).clamp(0.0, 3600.0) as f32 } else { 0.0 };
+        self.last_frame_time = now;
+        // Idle rotation only runs while someone can see it. (Browsers already stop drawing hidden
+        // tabs, and an embedded viewer has no keyboard focus until it is clicked.)
+        let active = cfg!(target_arch = "wasm32")
+            || ctx.input(|i| i.focused && i.viewport().minimized != Some(true) && i.viewport().occluded != Some(true));
+        // While frames are throttled the smoothed frame time is meaningless; use the real interval.
+        let cam_dt = if self.motion == Motion::AutoRotating { real_dt.min(0.1) } else { dt };
+        self.motion = self.camera.update(cam_dt, real_dt, active, w, h);
+        let moving = self.motion != Motion::Still;
         let proj = Projector::new(&self.camera.view, w, h);
 
         let mut paint = None;
@@ -561,10 +581,15 @@ impl NodalApp {
         self.last_map = Some(map);
         self.update_hash(dt, moving);
 
-        if moving || self.transition.is_some() || !self.status.is_complete() || self.status.pending > 0 {
+        // Draw only as often as what is happening needs: every frame while the user steers or
+        // tiles arrive, 30 fps for idle rotation, and not at all when nothing changes.
+        if self.motion == Motion::Moving || self.transition.is_some() || !self.status.is_complete() || self.status.pending > 0 {
             ctx.request_repaint();
-        } else if pulsing && self.current_scene().map(|s| !s.hotspots.is_empty()).unwrap_or(false) {
+        } else if self.motion == Motion::AutoRotating || (pulsing && self.current_scene().map(|s| !s.hotspots.is_empty()).unwrap_or(false))
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        } else if let Some(wait) = self.camera.autorotate_starts_in().filter(|_| active) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(wait + 0.05));
         }
     }
 
@@ -676,8 +701,7 @@ impl NodalApp {
         });
         let pressed = |k| ctx.input(|i| i.key_pressed(k));
         if pressed(Key::Space) {
-            self.camera.autorotate_on = !self.camera.autorotate_on;
-            self.camera.idle = if self.camera.autorotate_on { 1e3 } else { 0.0 };
+            self.camera.set_autorotate(!self.camera.autorotate_on);
         }
         if pressed(Key::P) {
             let next = match (self.camera.view.projection.mode, self.camera.view.projection.distortion > 0.5) {
@@ -775,6 +799,18 @@ impl NodalApp {
 impl eframe::App for NodalApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Count drawn frames per second: the measure of how hard the app works while idle.
+        // `NODAL_LOG_FRAMES=1` prints it, for checking power use.
+        let t = ctx.input(|i| i.time);
+        if t - self.frame_count.0 >= 1.0 {
+            self.frames_last_second = if t - self.frame_count.0 < 2.0 { self.frame_count.1 } else { 0 };
+            #[cfg(not(target_arch = "wasm32"))]
+            if std::env::var_os("NODAL_LOG_FRAMES").is_some() {
+                eprintln!("frames: {} in the last second ({:?})", self.frame_count.1, self.screen);
+            }
+            self.frame_count = (t, 0);
+        }
+        self.frame_count.1 += 1;
         for ev in self.loader.poll() {
             self.on_event(ev, &ctx);
         }

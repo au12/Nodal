@@ -139,8 +139,7 @@ fn bottom_bar(app: &mut NodalApp, ctx: &egui::Context, alpha: f32) {
                     )
                     .clicked()
                     {
-                        app.camera.autorotate_on = !rotating;
-                        app.camera.idle = if app.camera.autorotate_on { 1e3 } else { 0.0 };
+                        app.camera.set_autorotate(!rotating);
                     }
                     if icons::button(ui, Icon::Lens, "Projection (P)", app.ui.show_projection).clicked() {
                         app.ui.show_projection = !app.ui.show_projection;
@@ -330,7 +329,7 @@ fn stats(app: &NodalApp, ctx: &egui::Context) {
             theme::glass_frame().show(ui, |ui| {
                 ui.style_mut().override_font_id = Some(egui::FontId::monospace(11.5));
                 ui.label(&app.gpu_info);
-                ui.label(format!("{:5.1} fps", 1.0 / dt));
+                ui.label(format!("{:5.1} fps while drawing · {} frames in the last second", 1.0 / dt, app.frames_last_second));
                 ui.label(format!("yaw {:7.2}  pitch {:6.2}  fov {:6.2}", v.yaw, v.pitch, v.fov));
                 ui.label(format!("{} d={:.2} arch={:.2}", v.projection.label(), v.projection.distortion, v.projection.architectural));
                 ui.label(format!("visible tiles {}  missing {}  queued {}", st.wanted_on_screen, st.missing_on_screen, st.pending));

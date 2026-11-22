@@ -120,6 +120,7 @@ nodal stitch IMG_*.jpg -o pano.jpg --nadir-patch 25 --tour my-tour   # paint out
 nodal tile -o my-tour --title "My Tour" a.jpg b.jpg c.jpg   # create or extend a tour from panoramas
 nodal render my-tour --projection little-planet --size 3840x2160 -o planet.jpg   # headless GPU still
 nodal info my-tour                                          # summary + broken links
+nodal bench                                                 # time the stitcher on this machine
 ```
 
 `--projection` accepts `rectilinear`, `fisheye`, `stereographic`, `little-planet`, `pannini` and `equirect`.
@@ -278,7 +279,7 @@ result with a CPU reference renderer that samples the source equirect directly. 
 {
   "title": "Nodal Demo Tour",
   "start_scene": "venice-sunset",
-  "settings": { "autorotate": { "speed": 4, "delay": 6 }, "transition": { "kind": "zoom_fade", "duration": 0.9 } },
+  "settings": { "autorotate": { "speed": 4, "delay": 6, "max_seconds": 180 }, "transition": { "kind": "zoom_fade", "duration": 0.9 } },
   "scenes": [{
     "id": "royal-esplanade",
     "title": "Royal Esplanade",
@@ -296,6 +297,10 @@ result with a CPU reference renderer that samples the source equirect directly. 
 
 Angles are in degrees: yaw turns right, pitch looks up, and `fov` spans the longer edge of the screen.
 The actions are `goto` (with an optional arrival `yaw`, `pitch` and `fov`), `info`, `link` and `look_at`.
+
+Auto-rotation starts after `delay` seconds without input and winds down after `max_seconds`, so a
+tour left open does not keep the GPU busy. Set `max_seconds` to `0` for a kiosk that rotates forever.
+The viewer draws only when something changes: a still panorama uses no GPU or CPU time.
 
 ## Keyboard and mouse
 
@@ -404,7 +409,7 @@ GPU blending, stitching in the Docker web UI, a notarized Mac app and a Windows 
 ## Numbers
 
 These were measured on a 2-core cloud VM with a software rasterizer and no GPU, so real hardware is
-much faster.
+much faster. Run `nodal bench` to measure your own machine.
 
 | | |
 |---|---|

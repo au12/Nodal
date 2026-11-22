@@ -76,6 +76,14 @@ pub struct Autorotate {
     /// Ease pitch back to the horizon while rotating.
     #[serde(default = "yes")]
     pub level_horizon: bool,
+    /// Rotation winds down after this many seconds without input, so an idle window stops
+    /// drawing (and stops using power). 0 = keep rotating forever (kiosks).
+    #[serde(default = "d_ar_max")]
+    pub max_seconds: f32,
+}
+
+fn d_ar_max() -> f32 {
+    180.0
 }
 
 fn d_ar_speed() -> f32 {
@@ -87,7 +95,7 @@ fn d_ar_delay() -> f32 {
 
 impl Default for Autorotate {
     fn default() -> Self {
-        Self { enabled: true, speed: d_ar_speed(), delay: d_ar_delay(), level_horizon: true }
+        Self { enabled: true, speed: d_ar_speed(), delay: d_ar_delay(), level_horizon: true, max_seconds: d_ar_max() }
     }
 }
 
