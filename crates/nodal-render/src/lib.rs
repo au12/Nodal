@@ -5,12 +5,14 @@
 //! * [`Streamer`] ties them together each frame: plan → request → upload → flush.
 
 pub mod cache;
+pub mod compose;
 pub mod engine;
 pub mod fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod headless;
 pub mod stream;
 
+pub use compose::{ComposeFrame, ComposePhoto, Composer};
 pub use engine::{EngineStats, OverlayUniforms, PanoEngine, PanoUniforms};
 pub use fetch::{TileFetcher, TileImage, TileKey, TileRequest, Waker};
 pub use stream::Want;

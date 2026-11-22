@@ -6,8 +6,10 @@
 use crate::app::{NodalApp, Screen};
 use crate::icons::{self, Icon};
 use crate::theme;
+use eframe::egui_wgpu;
 use egui::{pos2, vec2, Align2, Color32, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Ui};
 use image::RgbImage;
+use nodal_render::{ComposeFrame, ComposePhoto, Composer};
 use nodal_stitch::align::LensSource;
 use nodal_stitch::features::DetectOptions;
 use nodal_stitch::nalgebra::{Rotation3, Vector3};
@@ -25,10 +27,16 @@ struct Photo {
     /// Reduced copy used for previews.
     small: Arc<RgbImage>,
     thumb: TextureHandle,
+    /// The photo resampled to the GPU preview's layer size (RGBA).
+    layer: Arc<Vec<u8>>,
 }
 
+/// Size every photo is resampled to for the GPU preview (the shader works in normalised coordinates).
+const LAYER_W: u32 = 1024;
+const LAYER_H: u32 = 768;
+
 enum Msg {
-    Loaded { sources: Vec<Source>, small: Vec<Arc<RgbImage>> },
+    Loaded { sources: Vec<Source>, small: Vec<Arc<RgbImage>>, layers: Vec<Arc<Vec<u8>>> },
     Aligned { project: Box<Project>, report: Option<Box<AlignReport>>, secs: f32 },
     Preview { pano: Box<Panorama>, generation: u64 },
     Saved { path: PathBuf, width: usize, height: usize, secs: f32, make_tour: bool },
@@ -66,6 +74,8 @@ struct Preview {
     vfov: f32,
     has_gaps: bool,
     filled: (bool, bool),
+    /// Canvas window it shows: yaw at the left edge, yaw span, pitch at the top, pitch span (radians).
+    window: [f32; 4],
 }
 
 struct Saved {
@@ -107,6 +117,13 @@ pub struct Stitcher {
     grid: bool,
     /// Photos waiting to be loaded once a frame (and its context) is available.
     pending: Vec<PathBuf>,
+    /// The GPU preview's photo textures need (re)uploading.
+    gpu_dirty: bool,
+    gpu_ready: bool,
+    /// Exposure gains from the latest rendered preview, reused by the GPU preview.
+    gains: Vec<[f32; 3]>,
+    /// Show the GPU preview until the next rendered preview arrives (the panorama just moved).
+    live: bool,
 }
 
 const WIDTHS: [(&str, u32); 7] =
@@ -144,6 +161,10 @@ impl Default for Stitcher {
             show_points: false,
             grid: false,
             pending: Vec::new(),
+            gpu_dirty: false,
+            gpu_ready: false,
+            gains: Vec::new(),
+            live: false,
         }
     }
 }
@@ -200,8 +221,19 @@ impl Stitcher {
                             let k = (1280.0 / w.max(h) as f32).min(1.0);
                             Arc::new(image::imageops::thumbnail(&*s.image, ((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1)))
                         })
+                        .collect::<Vec<Arc<RgbImage>>>();
+                    let layers = small
+                        .iter()
+                        .map(|sm| {
+                            let img = image::imageops::resize(&**sm, LAYER_W, LAYER_H, image::imageops::FilterType::Triangle);
+                            let mut rgba = Vec::with_capacity((LAYER_W * LAYER_H * 4) as usize);
+                            for p in img.pixels() {
+                                rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
+                            }
+                            Arc::new(rgba)
+                        })
                         .collect();
-                    Msg::Loaded { sources, small }
+                    Msg::Loaded { sources, small, layers }
                 }
                 Err(e) => Msg::Failed(format!("{e:#}")),
             };
@@ -360,8 +392,40 @@ impl Stitcher {
     fn rotate(&mut self, ctx: &egui::Context, g: Rotation3<f64>) {
         if let Some(p) = &mut self.project {
             p.rotate_world(&g);
+            self.live = self.gpu_ready;
             self.request_preview(ctx);
         }
+    }
+
+    /// Per-photo parameters for the GPU preview.
+    fn compose_photos(&self) -> Vec<ComposePhoto> {
+        let Some(p) = self.preview_project() else { return Vec::new() };
+        p.images
+            .iter()
+            .enumerate()
+            .map(|(i, img)| {
+                let m = p.lenses[img.lens].model();
+                let r = img.rot();
+                let r = r.matrix();
+                let kind = match m.kind {
+                    LensKind::Rectilinear => 0.0,
+                    LensKind::Fisheye => 1.0,
+                    LensKind::FisheyeEquisolid => 2.0,
+                    LensKind::FisheyeStereographic => 3.0,
+                };
+                let g = self.gains.get(i).copied().unwrap_or([1.0; 3]);
+                ComposePhoto {
+                    // World → camera is the transpose of camera → world: its rows are the columns of `r`.
+                    r0: [r[(0, 0)] as f32, r[(1, 0)] as f32, r[(2, 0)] as f32, kind],
+                    r1: [r[(0, 1)] as f32, r[(1, 1)] as f32, r[(2, 1)] as f32, m.f as f32],
+                    r2: [r[(0, 2)] as f32, r[(1, 2)] as f32, r[(2, 2)] as f32, m.r0 as f32],
+                    centre: [m.cx as f32, m.cy as f32, m.w as f32, m.h as f32],
+                    poly: [m.a as f32, m.b as f32, m.c as f32, m.d0 as f32],
+                    limits: [m.rho_max.min(1e9) as f32, m.theta_max as f32, 0.0, 0.0],
+                    gain: [g[0], g[1], g[2], if img.aligned && img.enabled { 1.0 } else { 0.0 }],
+                }
+            })
+            .collect()
     }
 
     fn default_name(&self) -> String {
@@ -388,9 +452,10 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
     while let Ok(msg) = app.stitcher.rx.try_recv() {
         let s = &mut app.stitcher;
         match msg {
-            Msg::Loaded { sources, small } => {
+            Msg::Loaded { sources, small, layers } => {
                 s.job = None;
-                for (src, sm) in sources.into_iter().zip(small) {
+                s.gpu_dirty = true;
+                for ((src, sm), layer) in sources.into_iter().zip(small).zip(layers) {
                     let thumb_img = image::imageops::thumbnail(&*sm, 160, (160 * sm.height() / sm.width().max(1)).max(1));
                     let color = egui::ColorImage::from_rgb([thumb_img.width() as usize, thumb_img.height() as usize], thumb_img.as_raw());
                     let name = src.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -399,7 +464,7 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
                     if summary.is_empty() {
                         summary = format!("{} × {}", src.image.width(), src.image.height());
                     }
-                    s.photos.push(Photo { name, summary, small: sm, thumb });
+                    s.photos.push(Photo { name, summary, small: sm, thumb, layer });
                     s.sources.push(src);
                 }
                 // New photos invalidate the alignment.
@@ -413,6 +478,7 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
             }
             Msg::Aligned { project, report, secs } => {
                 s.job = None;
+                s.gains.clear();
                 s.project = Some(*project);
                 if let Some(r) = report {
                     s.report = Some(*r);
@@ -432,6 +498,15 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
                     let img = egui::ColorImage::from_rgba_unmultiplied([pano.width, pano.height], &rgba);
                     let tex = ctx.load_texture("stitch-preview", img, TextureOptions::LINEAR);
                     let (hfov, vfov, _) = pano.coverage_degrees();
+                    let (fw, fh) = (pano.full_width as f32, pano.full_height as f32);
+                    let window = [
+                        (pano.crop_x as f32 / fw - 0.5) * std::f32::consts::TAU,
+                        pano.width as f32 / fw * std::f32::consts::TAU,
+                        (0.5 - pano.crop_y as f32 / fh) * std::f32::consts::PI,
+                        pano.height as f32 / fh * std::f32::consts::PI,
+                    ];
+                    s.gains = pano.stats.gains.clone();
+                    s.live = false;
                     s.preview = Some(Preview {
                         tex,
                         full_sphere: pano.is_full_sphere(),
@@ -439,6 +514,7 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
                         vfov,
                         has_gaps: pano.has_gaps(),
                         filled: (pano.stats.filled_zenith, pano.stats.filled_nadir),
+                        window,
                     });
                     s.drag_x = 0.0;
                     s.drag_y = 0.0;
@@ -505,8 +581,58 @@ fn reveal(path: &Path) {
     let _ = dir;
 }
 
-pub fn show(app: &mut NodalApp, ui: &mut Ui) {
+/// Draws the GPU preview inside egui's render pass.
+struct ComposeCallback {
+    frame: ComposeFrame,
+}
+
+impl egui_wgpu::CallbackTrait for ComposeCallback {
+    fn prepare(
+        &self,
+        _device: &eframe::wgpu::Device,
+        queue: &eframe::wgpu::Queue,
+        _screen: &egui_wgpu::ScreenDescriptor,
+        _encoder: &mut eframe::wgpu::CommandEncoder,
+        resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<eframe::wgpu::CommandBuffer> {
+        if let Some(c) = resources.get::<Composer>() {
+            c.write(queue, &self.frame);
+        }
+        vec![]
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        rpass: &mut eframe::wgpu::RenderPass<'static>,
+        resources: &egui_wgpu::CallbackResources,
+    ) {
+        if let Some(c) = resources.get::<Composer>() {
+            c.paint(rpass);
+        }
+    }
+}
+
+pub fn show(app: &mut NodalApp, ui: &mut Ui, frame: &mut eframe::Frame) {
     let ctx = ui.ctx().clone();
+    // Keep the GPU preview's photo textures in step with the photo set.
+    if app.stitcher.gpu_dirty {
+        if let Some(rs) = frame.wgpu_render_state() {
+            let s = &mut app.stitcher;
+            let mut renderer = rs.renderer.write();
+            if let Some(c) = renderer.callback_resources.get_mut::<Composer>() {
+                if !s.photos.is_empty() && s.photos.len() <= nodal_render::compose::MAX_PHOTOS {
+                    let layers: Vec<&[u8]> = s.photos.iter().map(|p| p.layer.as_slice()).collect();
+                    c.set_layers(&rs.device, &rs.queue, LAYER_W, LAYER_H, &layers);
+                    s.gpu_ready = true;
+                } else {
+                    c.clear();
+                    s.gpu_ready = false;
+                }
+            }
+            s.gpu_dirty = false;
+        }
+    }
     top_bar(app, ui);
     photo_panel(app, ui);
     settings_panel(app, ui);
@@ -992,7 +1118,29 @@ fn centre(app: &mut NodalApp, ui: &mut Ui) {
         }
         let painter = ui.painter().with_clip_rect(img);
         ui.painter().rect_filled(img.expand(1.0), 6.0, Color32::from_rgb(6, 7, 9));
-        if prev.full_sphere {
+        let moving = resp.dragged() || s.drag_x != 0.0 || s.drag_y != 0.0;
+        if s.gpu_ready && s.project.is_some() && (moving || s.live) {
+            // Live GPU composite: the photos are re-projected every frame, so the panorama follows
+            // the pointer in yaw and pitch while the full-quality preview catches up.
+            let (yaw, pitch) =
+                if prev.full_sphere { (s.drag_x * 360.0, s.drag_y * 180.0) } else { (s.drag_x * prev.hfov, s.drag_y * prev.vfov) };
+            let g = Rotation3::from_axis_angle(&Vector3::x_axis(), (pitch as f64).to_radians())
+                * Rotation3::from_axis_angle(&Vector3::y_axis(), (yaw as f64).to_radians());
+            let inv = g.inverse();
+            let m = inv.matrix();
+            let ppp = ctx.pixels_per_point();
+            let frame = ComposeFrame {
+                world: [
+                    [m[(0, 0)] as f32, m[(0, 1)] as f32, m[(0, 2)] as f32],
+                    [m[(1, 0)] as f32, m[(1, 1)] as f32, m[(1, 2)] as f32],
+                    [m[(2, 0)] as f32, m[(2, 1)] as f32, m[(2, 2)] as f32],
+                ],
+                rect: [img.left() * ppp, img.top() * ppp, img.width() * ppp, img.height() * ppp],
+                crop: prev.window,
+                photos: s.compose_photos(),
+            };
+            ui.painter().add(egui_wgpu::Callback::new_paint_callback(img, ComposeCallback { frame }));
+        } else if prev.full_sphere {
             // A full panorama wraps: show the horizontal drag live by sliding it around.
             let off = s.drag_x.rem_euclid(1.0);
             for dx in [off - 1.0, off] {
@@ -1021,7 +1169,8 @@ fn centre(app: &mut NodalApp, ui: &mut Ui) {
                 if prev.full_sphere { (s.drag_x * 360.0, s.drag_y * 180.0) } else { (s.drag_x * prev.hfov, s.drag_y * prev.vfov) };
             let g = Rotation3::from_axis_angle(&Vector3::x_axis(), (pitch as f64).to_radians())
                 * Rotation3::from_axis_angle(&Vector3::y_axis(), (yaw as f64).to_radians());
-            if !prev.full_sphere {
+            let gpu = s.gpu_ready;
+            if !prev.full_sphere || gpu {
                 s.drag_x = 0.0;
             }
             s.drag_y = 0.0;

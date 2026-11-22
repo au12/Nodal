@@ -116,6 +116,13 @@ impl Headless {
     }
 
     fn read_back(&mut self, proj: &Projector, width: u32, height: u32) -> Result<image::RgbaImage, String> {
+        let engine = &self.engine;
+        let (device, queue) = (&self.device, &self.queue);
+        self.draw_and_read(width, height, |view| engine.render_to(device, queue, view, proj, 0.0))
+    }
+
+    /// Renders into an offscreen target with `draw` and reads the pixels back.
+    pub fn draw_and_read(&self, width: u32, height: u32, draw: impl FnOnce(&wgpu::TextureView)) -> Result<image::RgbaImage, String> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("nodal still"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -127,7 +134,7 @@ impl Headless {
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
-        self.engine.render_to(&self.device, &self.queue, &view, proj, 0.0);
+        draw(&view);
         let padded = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("nodal readback"),
