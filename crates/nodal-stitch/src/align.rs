@@ -138,7 +138,8 @@ fn pair_inliers(features: &[FeatureSet], p: &Pair, ma: &LensModel, mb: &LensMode
 
 /// Scores a lens hypothesis by how many matches agree with a pure rotation.
 fn score_lens(features: &[FeatureSet], pairs: &[&Pair], project: &Project, lens_idx: usize, cand: &Lens, tol_px: f64) -> usize {
-    let models: Vec<LensModel> = project.lenses.iter().enumerate().map(|(i, l)| if i == lens_idx { cand.model() } else { l.model() }).collect();
+    let models: Vec<LensModel> =
+        project.lenses.iter().enumerate().map(|(i, l)| if i == lens_idx { cand.model() } else { l.model() }).collect();
     pairs
         .par_iter()
         .map(|p| {
@@ -148,8 +149,16 @@ fn score_lens(features: &[FeatureSet], pairs: &[&Pair], project: &Project, lens_
         .sum()
 }
 
-fn estimate_lens(features: &[FeatureSet], pairs: &[Pair], project: &Project, lens_idx: usize, kinds: &[LensKind], tol_px: f64) -> Option<(Lens, usize)> {
-    let involved: Vec<&Pair> = pairs.iter().filter(|p| project.images[p.a].lens == lens_idx || project.images[p.b].lens == lens_idx).collect();
+fn estimate_lens(
+    features: &[FeatureSet],
+    pairs: &[Pair],
+    project: &Project,
+    lens_idx: usize,
+    kinds: &[LensKind],
+    tol_px: f64,
+) -> Option<(Lens, usize)> {
+    let involved: Vec<&Pair> =
+        pairs.iter().filter(|p| project.images[p.a].lens == lens_idx || project.images[p.b].lens == lens_idx).collect();
     if involved.is_empty() {
         return None;
     }
@@ -157,7 +166,11 @@ fn estimate_lens(features: &[FeatureSet], pairs: &[Pair], project: &Project, len
     let mut best: Option<(Lens, usize)> = None;
     let mut best_rect = 0usize;
     for &kind in kinds {
-        let grid: &[f64] = if kind.is_fisheye() { &[90.0, 105.0, 120.0, 140.0, 160.0, 180.0, 200.0] } else { &[10.0, 14.0, 19.0, 25.0, 32.0, 40.0, 49.0, 58.0, 67.0, 77.0, 88.0, 100.0, 112.0] };
+        let grid: &[f64] = if kind.is_fisheye() {
+            &[90.0, 105.0, 120.0, 140.0, 160.0, 180.0, 200.0]
+        } else {
+            &[10.0, 14.0, 19.0, 25.0, 32.0, 40.0, 49.0, 58.0, 67.0, 77.0, 88.0, 100.0, 112.0]
+        };
         let mut scored: Vec<(f64, usize)> = grid
             .iter()
             .map(|&v| {
@@ -177,7 +190,7 @@ fn estimate_lens(features: &[FeatureSet], pairs: &[Pair], project: &Project, len
         let mut step = v * 0.12;
         for _ in 0..5 {
             for cand in [v - step, v + step] {
-                if cand < 4.0 || cand > 300.0 || (!kind.is_fisheye() && cand > 150.0) {
+                if !(4.0..=300.0).contains(&cand) || (!kind.is_fisheye() && cand > 150.0) {
                     continue;
                 }
                 let mut l = base;
@@ -360,9 +373,8 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
             (None, Some(k)) => vec![k],
             (None, None) => vec![LensKind::Rectilinear, LensKind::Fisheye],
         };
-        if exif.focal_35mm.is_some() {
+        if let Some(f35) = exif.focal_35mm {
             // Focal length known but the mapping is ambiguous (very wide lens): test both mappings at that focal length.
-            let f35 = exif.focal_35mm.unwrap();
             let l0 = project.lenses[li];
             let involved: Vec<&Pair> = quick.iter().filter(|p| project.images[p.a].lens == li || project.images[p.b].lens == li).collect();
             let mut best = (l0, 0usize);
@@ -423,14 +435,18 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
     if comp.iter().any(|&c| c != comp[0]) {
         progress(0.45, "Searching for more overlaps");
         let tried: std::collections::HashSet<(usize, usize)> = promising.iter().copied().collect();
-        let extra: Vec<(usize, usize)> = all_pairs.iter().copied().filter(|&(a, b)| comp[a] != comp[b] && !tried.contains(&(a, b))).collect();
+        let extra: Vec<(usize, usize)> =
+            all_pairs.iter().copied().filter(|&(a, b)| comp[a] != comp[b] && !tried.contains(&(a, b))).collect();
         verified.extend(extra.par_iter().filter_map(|&(a, b)| verify(a, b)).collect::<Vec<_>>());
     }
     verified.sort_by_key(|(p, _)| (p.a, p.b));
     for (p, fit) in &verified {
         report.pairs.push(PairStat { a: p.a, b: p.b, matches: p.raw.len(), inliers: fit.inliers.len() });
     }
-    anyhow::ensure!(!verified.is_empty(), "No overlapping images were found. Check that the photos overlap by at least 20–30 % and that the lens type is right.");
+    anyhow::ensure!(
+        !verified.is_empty(),
+        "No overlapping images were found. Check that the photos overlap by at least 20–30 % and that the lens type is right."
+    );
 
     // 4. Initial orientations: grow a maximum spanning tree from the best-connected image.
     progress(0.5, "Placing images");
@@ -448,10 +464,7 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
     rots[anchor] = Some(Rotation3::identity());
     loop {
         // Strongest edge leaving the placed set.
-        let next = verified
-            .iter()
-            .filter(|(p, _)| rots[p.a].is_some() != rots[p.b].is_some())
-            .max_by_key(|(_, f)| f.inliers.len());
+        let next = verified.iter().filter(|(p, _)| rots[p.a].is_some() != rots[p.b].is_some()).max_by_key(|(_, f)| f.inliers.len());
         let Some((p, fit)) = next else { break };
         if let Some(ra) = rots[p.a] {
             rots[p.b] = Some(ra * fit.r);
@@ -502,7 +515,11 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
         .collect();
     let run = |project: &mut Project, flags: LensFlags, huber: f64| {
         let cps = project.control_points.clone();
-        optimize::optimize(project, &cps, &OptOptions { flags, huber_px: huber, max_iters: 60, fov_prior: fov_prior.clone(), fixed: fixed.clone() })
+        optimize::optimize(
+            project,
+            &cps,
+            &OptOptions { flags, huber_px: huber, max_iters: 60, fov_prior: fov_prior.clone(), fixed: fixed.clone() },
+        )
     };
     let floor = (1.5 * px_mean) as f32;
     let r = run(project, LensFlags::NONE, 3.0 * px_mean);
@@ -523,7 +540,8 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
             }
             progress(0.6 + 0.07 * (i + 1) as f32, "Calibrating lens");
             let backup = project.clone();
-            let before = optimize::error_stats(project, &project.control_points, &project.images.iter().map(|i| i.lens).collect::<Vec<_>>()).0;
+            let before =
+                optimize::error_stats(project, &project.control_points, &project.images.iter().map(|i| i.lens).collect::<Vec<_>>()).0;
             let r = run(project, *flags, 2.5 * px_mean);
             let sane = project.lenses.iter().all(|l| l.hfov.is_finite() && l.hfov > 1.0 && (l.a.abs() + l.b.abs() + l.c.abs()) < 0.9);
             if !sane || r.rms > before * 1.001 {
@@ -543,7 +561,17 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
     progress(0.9, "Refining control points");
     let added = guided_points(project, features, opts, 5.0 * px_mean);
     if added > 0 {
-        let flags = if opts.optimize_lens { LensFlags { fov: !user_lens, a: true, b: true, c: true, shift: project.control_points.len() / project.lenses.len().max(1) >= 150 } } else { LensFlags::NONE };
+        let flags = if opts.optimize_lens {
+            LensFlags {
+                fov: !user_lens,
+                a: true,
+                b: true,
+                c: true,
+                shift: project.control_points.len() / project.lenses.len().max(1) >= 150,
+            }
+        } else {
+            LensFlags::NONE
+        };
         let backup = project.clone();
         let r = run(project, flags, 2.0 * px_mean);
         let sane = project.lenses.iter().all(|l| l.hfov.is_finite() && (l.a.abs() + l.b.abs() + l.c.abs()) < 0.9);

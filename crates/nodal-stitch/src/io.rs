@@ -46,11 +46,9 @@ pub fn read_exif(bytes: &[u8]) -> ExifInfo {
     info.taken = get(exif::Tag::DateTimeOriginal).and_then(text);
     // Derive the 35 mm equivalent from the sensor size when the camera did not record it.
     if info.focal_35mm.is_none() {
-        if let (Some(f), Some(res), Some(px)) = (
-            info.focal_mm,
-            get(exif::Tag::FocalPlaneXResolution).and_then(rational),
-            get(exif::Tag::PixelXDimension).and_then(rational),
-        ) {
+        if let (Some(f), Some(res), Some(px)) =
+            (info.focal_mm, get(exif::Tag::FocalPlaneXResolution).and_then(rational), get(exif::Tag::PixelXDimension).and_then(rational))
+        {
             let unit_mm = match get(exif::Tag::FocalPlaneResolutionUnit).and_then(rational).unwrap_or(2.0) as u32 {
                 3 => 10.0,
                 4 => 1.0,
@@ -86,4 +84,63 @@ pub fn decode(bytes: &[u8]) -> Result<(RgbImage, ExifInfo)> {
 pub fn load(path: &Path) -> Result<(RgbImage, ExifInfo)> {
     let bytes = std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
     decode(&bytes).with_context(|| format!("could not load {}", path.display()))
+}
+
+/// XMP packet with Google Photo Sphere (GPano) metadata, so viewers recognise the panorama and
+/// know which part of the sphere a cropped image covers.
+pub fn gpano_xmp(pano: &crate::render::Panorama) -> String {
+    format!(
+        concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Nodal\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\" xmlns:GPano=\"http://ns.google.com/photos/1.0/panorama/\" ",
+            "GPano:ProjectionType=\"equirectangular\" GPano:UsePanoramaViewer=\"True\" GPano:StitchingSoftware=\"Nodal {}\" ",
+            "GPano:CroppedAreaImageWidthPixels=\"{}\" GPano:CroppedAreaImageHeightPixels=\"{}\" ",
+            "GPano:FullPanoWidthPixels=\"{}\" GPano:FullPanoHeightPixels=\"{}\" ",
+            "GPano:CroppedAreaLeftPixels=\"{}\" GPano:CroppedAreaTopPixels=\"{}\"/>",
+            "</rdf:RDF></x:xmpmeta>"
+        ),
+        env!("CARGO_PKG_VERSION"),
+        pano.width,
+        pano.height,
+        pano.full_width,
+        pano.full_height,
+        pano.crop_x,
+        pano.crop_y
+    )
+}
+
+/// Encodes a panorama as JPEG with GPano metadata.
+pub fn encode_jpeg(pano: &crate::render::Panorama, quality: u8) -> Result<Vec<u8>> {
+    anyhow::ensure!(pano.width <= 65535 && pano.height <= 65535, "JPEG cannot store images larger than 65535 pixels; use TIFF or PNG");
+    let mut out = Vec::new();
+    let mut enc = jpeg_encoder::Encoder::new(&mut out, quality.clamp(1, 100));
+    enc.set_sampling_factor(if quality >= 90 { jpeg_encoder::SamplingFactor::R_4_4_4 } else { jpeg_encoder::SamplingFactor::R_4_2_0 });
+    let mut xmp = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+    xmp.extend_from_slice(gpano_xmp(pano).as_bytes());
+    enc.add_app_segment(1, &xmp)?;
+    enc.encode(&pano.rgb, pano.width as u16, pano.height as u16, jpeg_encoder::ColorType::Rgb)?;
+    Ok(out)
+}
+
+/// Saves a panorama; the format follows the file extension (jpg, png, tif). PNG and TIFF keep
+/// transparency where the panorama has gaps.
+pub fn save_panorama(pano: &crate::render::Panorama, path: &Path, quality: u8) -> Result<()> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => std::fs::write(path, encode_jpeg(pano, quality)?)?,
+        "png" | "tif" | "tiff" => {
+            if pano.has_gaps() {
+                let mut rgba = Vec::with_capacity(pano.width * pano.height * 4);
+                for (p, a) in pano.rgb.chunks_exact(3).zip(&pano.alpha) {
+                    rgba.extend_from_slice(&[p[0], p[1], p[2], *a]);
+                }
+                image::RgbaImage::from_raw(pano.width as u32, pano.height as u32, rgba).context("buffer size")?.save(path)?;
+            } else {
+                image::save_buffer(path, &pano.rgb, pano.width as u32, pano.height as u32, image::ColorType::Rgb8)?;
+            }
+        }
+        other => anyhow::bail!("unsupported output format \".{other}\" (use .jpg, .png or .tif)"),
+    }
+    Ok(())
 }

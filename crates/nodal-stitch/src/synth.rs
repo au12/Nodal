@@ -97,3 +97,63 @@ pub fn render_shot(pano: &RgbImage, lens: &Lens, rot: &Rotation3<f64>, opts: &Sh
     });
     RgbImage::from_raw(w as u32, h as u32, out).expect("buffer size")
 }
+
+fn hash3(x: i32, y: i32, z: i32, seed: u32) -> f32 {
+    let mut h = (x as u32).wrapping_mul(0x8da6b343)
+        ^ (y as u32).wrapping_mul(0xd8163841)
+        ^ (z as u32).wrapping_mul(0xcb1ab31f)
+        ^ seed.wrapping_mul(0x9e3779b9);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1e995);
+    h ^= h >> 15;
+    (h & 0xffff) as f32 / 65535.0
+}
+
+fn value_noise(p: [f32; 3], seed: u32) -> f32 {
+    let f = [p[0].floor(), p[1].floor(), p[2].floor()];
+    let t = [p[0] - f[0], p[1] - f[1], p[2] - f[2]];
+    let s = t.map(|v| v * v * (3.0 - 2.0 * v));
+    let (x, y, z) = (f[0] as i32, f[1] as i32, f[2] as i32);
+    let mut acc = 0.0;
+    for dz in 0..2 {
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let w = (if dx == 1 { s[0] } else { 1.0 - s[0] })
+                    * (if dy == 1 { s[1] } else { 1.0 - s[1] })
+                    * (if dz == 1 { s[2] } else { 1.0 - s[2] });
+                acc += w * hash3(x + dx, y + dy, z + dz, seed);
+            }
+        }
+    }
+    acc
+}
+
+/// A procedurally textured equirectangular panorama (seamless on the sphere, rich in detail at
+/// every scale) for tests that must not depend on downloaded images.
+pub fn procedural_pano(width: u32, seed: u32) -> RgbImage {
+    let (w, h) = (width as usize, (width / 2) as usize);
+    let mut out = vec![0u8; w * h * 3];
+    out.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        let pitch = (0.5 - (y as f32 + 0.5) / h as f32) * std::f32::consts::PI;
+        for x in 0..w {
+            let yaw = ((x as f32 + 0.5) / w as f32 - 0.5) * std::f32::consts::TAU;
+            let d = [yaw.sin() * pitch.cos(), pitch.sin(), yaw.cos() * pitch.cos()];
+            for c in 0..3 {
+                let mut v = 0.0;
+                let mut amp = 0.5;
+                let mut freq = 3.0;
+                for o in 0..7 {
+                    let p = [d[0] * freq + 17.0, d[1] * freq + 31.0, d[2] * freq + 47.0];
+                    let n = value_noise(p, seed.wrapping_add(o * 7 + if o < 3 { 0 } else { c as u32 * 101 }));
+                    // Sharpen a few octaves into blobs so there are corners as well as gradients.
+                    v += amp * if o % 2 == 1 { ((n - 0.5) * 6.0).clamp(-0.5, 0.5) + 0.5 } else { n };
+                    amp *= 0.62;
+                    freq *= 2.1;
+                }
+                let sky = 0.15 * (d[1] * 0.5 + 0.5) * (c as f32 * 0.4 + 0.6);
+                row[x * 3 + c] = ((v / 1.25 + sky).clamp(0.0, 1.0) * 255.0) as u8;
+            }
+        }
+    });
+    RgbImage::from_raw(w as u32, h as u32, out).expect("buffer size")
+}
