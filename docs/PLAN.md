@@ -16,9 +16,9 @@ work can resume from a cold start.
    full-res re-sampling. Known weak case: complex man-made structure overhead (station roofs)
 5. [x] GPU: live stitch preview compositor (`nodal-render/src/compose.rs`). GPU warp/blend for the
    final render is still open (CPU path is multi-threaded)
-6. [~] App: stitch workspace (`nodal-app/src/stitcher.rs`) with live preview, lens/alignment/output
-   panels, Save panorama and Create tour. Still to do: project save/open, mask painting, circular
-   fisheye crop detection, server-side stitching for the Docker image
+6. [x] App: stitch workspace (`nodal-app/src/stitcher.rs`) with live preview, lens/alignment/output
+   panels, Save panorama and Create tour. Project save/open works (`.nodal`). Still to do: mask
+   painting, control point editor, circular fisheye crop detection, server-side stitching
 7. [x] Docs, screenshots, changelog, version 0.2.0 (tag `v0.2.0` must be pushed by the owner)
 
 ## Conventions

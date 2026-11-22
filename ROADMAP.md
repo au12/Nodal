@@ -38,12 +38,12 @@ plan will change as real use shows what matters. Ideas and requests are welcome 
 - [x] **Stitching workspace** in the native app with a GPU live preview
 - [x] **`nodal stitch`** command and photos-to-tour in one step
 - [x] **GPano metadata** written by the stitcher and read by the tiler
+- [x] **Project files** (`.nodal`): save a stitch and reopen it later with its alignment intact
 
 ## ⏳ 0.3: Stitching, deeper
 
 - [ ] **Mask painting.** Mark areas to keep or exclude (people, the tripod, your own shadow)
 - [ ] **Control point editor.** See, add and remove points on the photos
-- [ ] **Project files.** Save and reopen a stitching project from the app (the CLI already writes them)
 - [ ] **Exposure brackets and HDR.** Merge bracketed shots and blend with exposure fusion
 - [ ] **RAW input** and a 16-bit pipeline with 16-bit TIFF output
 - [ ] **Circular fisheye** crop detection, and per-photo lens parameters for mixed sets
