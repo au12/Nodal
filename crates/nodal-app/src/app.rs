@@ -21,6 +21,8 @@ const MAX_UPLOADS_PER_FRAME: usize = if cfg!(target_arch = "wasm32") { 8 } else 
 pub enum Screen {
     Library,
     Viewer,
+    /// The stitching workspace (native app).
+    Stitch,
 }
 
 pub enum Cmd {
@@ -98,6 +100,8 @@ pub struct NodalApp {
     pub ui: UiState,
     pub editor: Editor,
     pub library: Library,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub stitcher: crate::stitcher::Stitcher,
     pub status: StreamStatus,
     pub debug_mode: u32,
     pub server: Option<ServerConfig>,
@@ -184,6 +188,8 @@ impl NodalApp {
             ui: UiState { ui_alpha: 1.0, ..Default::default() },
             editor: Editor::default(),
             library: Library::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            stitcher: Default::default(),
             status: StreamStatus::default(),
             debug_mode: 0,
             server: None,
@@ -750,7 +756,11 @@ impl NodalApp {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let paths: Vec<std::path::PathBuf> = files.iter().map(|f| f.path().to_path_buf()).collect();
-            library::open_paths(self, paths);
+            if self.screen == Screen::Stitch {
+                self.stitcher.add_photos(ctx, paths);
+            } else {
+                library::open_paths(self, paths);
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -766,6 +776,8 @@ impl eframe::App for NodalApp {
         for ev in self.loader.poll() {
             self.on_event(ev, &ctx);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::stitcher::poll(self, &ctx);
         self.handle_dropped_files(&ctx);
         self.process_cmds(&ctx, frame);
         // Auto-hide the viewer chrome after a few idle seconds.
@@ -775,7 +787,7 @@ impl eframe::App for NodalApp {
             self.ui.last_activity = now;
         }
         let keep =
-            self.editor.open || self.ui.info.is_some() || self.ui.show_projection || self.ui.show_help || self.screen == Screen::Library;
+            self.editor.open || self.ui.info.is_some() || self.ui.show_projection || self.ui.show_help || self.screen != Screen::Viewer;
         let target = if keep || now - self.ui.last_activity < 3.5 { 1.0 } else { 0.0 };
         self.ui.ui_alpha = ctx.animate_value_with_time(egui::Id::unique("ui_alpha"), target, 0.35);
         if self.ui.ui_alpha > 0.0 && self.ui.ui_alpha < 1.0 {
@@ -787,6 +799,10 @@ impl eframe::App for NodalApp {
         match self.screen {
             Screen::Library => library::show(self, ui),
             Screen::Viewer => self.viewer(ui, frame),
+            #[cfg(not(target_arch = "wasm32"))]
+            Screen::Stitch => crate::stitcher::show(self, ui),
+            #[cfg(target_arch = "wasm32")]
+            Screen::Stitch => library::show(self, ui),
         }
         self.process_cmds(&ctx, frame);
         chrome::toasts(self, &ctx);

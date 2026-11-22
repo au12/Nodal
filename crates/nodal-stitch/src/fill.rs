@@ -377,7 +377,7 @@ fn coherence_factor(l: &Level, nnf: &[(i32, i32)], p: (isize, isize), q: (i32, i
 /// everything around is equally textured the term is the same for every candidate and has no effect.
 #[inline]
 fn structure_prior(l: &Level, p: usize, q: usize) -> f32 {
-    l.energy[q] * (l.depth[p] * 2.5).min(1.0)
+    l.energy[q] * (l.depth[p] * 4.0).min(1.0)
 }
 
 /// One PatchMatch sweep (propagation + random search), parallel over horizontal strips.

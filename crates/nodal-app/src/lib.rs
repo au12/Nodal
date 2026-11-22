@@ -10,6 +10,8 @@ mod library;
 pub mod loader;
 mod net;
 pub mod platform;
+#[cfg(not(target_arch = "wasm32"))]
+mod stitcher;
 mod theme;
 
 pub use app::NodalApp;

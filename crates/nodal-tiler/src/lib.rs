@@ -294,9 +294,16 @@ pub fn build_tour(inputs: &[PathBuf], tour_dir: &Path, title: Option<&str>, opts
         let id = tour.unique_scene_id(&slugify(&scene_title));
         let sub = |f: f32, stage: &str| progress((i as f32 + f) / n, &format!("{scene_title}: {stage}"));
         sub(0.0, "decoding");
-        let img = load_image(input)?;
+        let bytes = std::fs::read(input).with_context(|| format!("could not read {}", input.display()))?;
+        let img = load_image_bytes(&bytes).with_context(|| format!("could not decode {}", input.display()))?;
+        // Panorama metadata in the file beats guessing from the aspect ratio.
+        let mut scene_opts = opts.clone();
+        if scene_opts.coverage.is_none() {
+            scene_opts.coverage = Coverage::from_gpano(&bytes);
+        }
+        drop(bytes);
         let file_name = input.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let scene = tile_scene(img, tour_dir, &id, &scene_title, &file_name, opts, &sub)?;
+        let scene = tile_scene(img, tour_dir, &id, &scene_title, &file_name, &scene_opts, &sub)?;
         tour.scenes.push(scene);
     }
     if tour.start_scene.is_none() {
