@@ -2123,6 +2123,7 @@ dependencies = [
  "log",
  "nodal-core",
  "nodal-render",
+ "nodal-stitch",
  "nodal-tiler",
  "pollster 0.4.0",
  "rfd",

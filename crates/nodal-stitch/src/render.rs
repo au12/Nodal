@@ -292,7 +292,9 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
     stats.bands = bands;
     let align = 1usize << bands;
     let scale = width as f64 / lw as f64;
-    let ctx = (4 * align) as i64;
+    // Context around each photo's share: the mask of the coarsest band spreads about two of its
+    // pixels beyond the seam.
+    let ctx = (2 * align + 8) as i64;
     // Full-resolution rectangle each photo is needed in (unwrapped canvas coordinates).
     let rois: Vec<Option<Roi>> = used
         .iter()
@@ -324,6 +326,7 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
         let y1 = rois.iter().flatten().map(|r| r.y0 + r.h as i64).max().unwrap_or(a).min(h as i64);
         (x0, y0, (x1 - x0) as usize, (y1 - y0) as usize)
     };
+    let profile = std::env::var_os("NODAL_PROFILE").is_some();
     let mut blender = Blender::new(bw, bh, bands);
     let a = align as i64;
     for (k, &i) in active.iter().enumerate() {
@@ -341,10 +344,16 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
         };
         for (bx0, bx1) in spans {
             let (lw_px, lh_px) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
+            let t0 = Instant::now();
             let layer = warper.render(&canvas, Roi { x0: bx0 + origin_x, y0: by0 + origin_y, w: lw_px, h: lh_px }, opts.filter, false);
+            let t1 = Instant::now();
             let mask = layer_mask(&layer, &canvas, &labels, lw, lh, k as u16);
             let alpha: Vec<f32> = layer.alpha.par_iter().map(|&a| if a > 0 { 1.0 } else { 0.0 }).collect();
+            let t2 = Instant::now();
             blender.feed(bx0, by0, lw_px, lh_px, layer.rgb, alpha, mask);
+            if profile {
+                eprintln!("layer {k}: {lw_px}x{lh_px} warp {:.2?} mask {:.2?} blend {:.2?}", t1 - t0, t2 - t1, t2.elapsed());
+            }
         }
     }
     lap(&mut stats, "warp + blend");
