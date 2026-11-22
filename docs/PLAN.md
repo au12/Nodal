@@ -12,7 +12,8 @@ work can resume from a cold start.
 2. [~] Render: tiled warp, exposure/WB compensation, graph-cut seams, multi-band blending, output + XMP
    done; `nodal stitch` CLI and performance tuning (warp+blend ~3 MP/s on 2 cores) still to do
 3. [ ] Local alignment: guided matching, smooth per-image warp fields
-4. [ ] Pole patching: PatchMatch fill in pole-centred view
+4. [x] Pole patching (`fill.rs`): thin-plate base + coherent multi-scale PatchMatch in a pole view,
+   full-res re-sampling. Known weak case: complex man-made structure overhead (station roofs)
 5. [ ] GPU: live stitch preview shader, GPU warp path
 6. [ ] App: unified UI, stitch workspace, project files, send-to-tour
 7. [ ] Docs, screenshots, changelog, version 0.2.0

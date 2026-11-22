@@ -380,6 +380,13 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
         stats,
     };
     crop_to_coverage(&mut pano);
+    if proj.output.pole_fill == crate::project::PoleFill::Auto && pano.is_full_sphere() {
+        let t = Instant::now();
+        let fill =
+            crate::fill::FillOptions { zenith_patch: proj.output.zenith_patch, nadir_patch: proj.output.nadir_patch, ..Default::default() };
+        crate::fill::fill_poles(&mut pano, &fill, &|f, s| progress(0.9 + 0.1 * f, s));
+        pano.stats.timings.push(("pole patch".to_string(), t.elapsed().as_secs_f32()));
+    }
     progress(1.0, "Done");
     Ok(pano)
 }

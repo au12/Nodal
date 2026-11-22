@@ -127,3 +127,53 @@ fn rectilinear_partial_panorama_matches_ground_truth() {
     let (db, _) = psnr(&scene, &pano);
     assert!(db > 24.0, "PSNR {db:.1} dB");
 }
+
+#[test]
+fn pole_gaps_are_filled_seamlessly() {
+    use nodal_stitch::fill::{fill_poles, pole_gap, FillOptions};
+    let truth = procedural_pano(1536, 5);
+    let (w, h) = (truth.width() as usize, truth.height() as usize);
+    let mut rgb = truth.as_raw().clone();
+    let mut alpha = vec![255u8; w * h];
+    let (zenith, nadir) = (18.0f32, 26.0f32);
+    for y in 0..h {
+        let colat = (y as f32 + 0.5) / h as f32 * 180.0;
+        if colat < zenith || 180.0 - colat < nadir {
+            alpha[y * w..(y + 1) * w].fill(0);
+            rgb[y * w * 3..(y + 1) * w * 3].fill(0);
+        }
+    }
+    let mut pano = nodal_stitch::Panorama {
+        width: w,
+        height: h,
+        rgb,
+        alpha,
+        full_width: w,
+        full_height: h,
+        crop_x: 0,
+        crop_y: 0,
+        stats: Default::default(),
+    };
+    assert!((pole_gap(&pano, true, 62.0).unwrap() - zenith).abs() < 1.0);
+    let report = fill_poles(&mut pano, &FillOptions::default(), &|_, _| {});
+    assert!(report.zenith.is_some() && report.nadir.is_some(), "{report:?}");
+    assert!(!pano.has_gaps(), "every pixel must be filled");
+    // Untouched outside the patched caps (a few degrees of cross-fade allowed).
+    for y in (h * 30 / 180)..(h * 145 / 180) {
+        assert_eq!(&pano.rgb[y * w * 3..(y + 1) * w * 3], &truth.as_raw()[y * w * 3..(y + 1) * w * 3], "row {y} changed");
+    }
+    // The patch has the same overall tone and texture strength as the material around it.
+    let stats = |img: &[u8], y0: usize, y1: usize| {
+        let px = &img[y0 * w * 3..y1 * w * 3];
+        let mean = px.iter().map(|v| *v as f64).sum::<f64>() / px.len() as f64;
+        let var = px.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / px.len() as f64;
+        (mean, var.sqrt())
+    };
+    for (y0, y1) in [(0, h * 16 / 180), (h * 156 / 180, h)] {
+        let (m_fill, s_fill) = stats(&pano.rgb, y0, y1);
+        let (m_true, s_true) = stats(truth.as_raw(), y0, y1);
+        // The hidden cap can only be guessed, so this is a sanity bound, not an accuracy claim.
+        assert!((m_fill - m_true).abs() < 35.0, "tone {m_fill:.1} vs {m_true:.1}");
+        assert!(s_fill > s_true * 0.5 && s_fill < s_true * 1.6, "texture {s_fill:.1} vs {s_true:.1}");
+    }
+}
