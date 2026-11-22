@@ -23,11 +23,14 @@ pub struct AlignOptions {
     pub level: bool,
     /// Control points kept per image pair.
     pub max_points_per_pair: usize,
+    /// Measure every overlap densely after the global alignment (second adjustment, local warps,
+    /// parallax diagnostics).
+    pub dense: bool,
 }
 
 impl Default for AlignOptions {
     fn default() -> Self {
-        AlignOptions { lens: None, quick_features: 900, ratio: 0.8, optimize_lens: true, level: true, max_points_per_pair: 400 }
+        AlignOptions { lens: None, quick_features: 900, ratio: 0.8, optimize_lens: true, level: true, max_points_per_pair: 400, dense: true }
     }
 }
 
@@ -52,6 +55,10 @@ pub struct AlignReport {
     pub log: Vec<String>,
     /// Result of the local alignment pass, when it ran.
     pub local: Option<crate::local::LocalReport>,
+    /// Dense overlap registration, when it ran.
+    pub dense: Option<crate::dense::DenseReport>,
+    /// Exposure, white balance and vignetting calibration.
+    pub photometric: Option<crate::photometric::PhotoReport>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +117,7 @@ pub fn new_project(images: &[(PathBuf, u32, u32, ExifInfo)]) -> Project {
             enabled: true,
             gain: [1.0; 3],
             warp: None,
+            mask: None,
         });
     }
     project

@@ -13,7 +13,7 @@ use crate::blend::{expand, extrapolated_pyramid, reduce, Plane};
 use crate::lens::V3;
 use crate::matching::Rng;
 use crate::render::Panorama;
-use crate::synth::sample_bicubic;
+
 use crate::Progress;
 use rayon::prelude::*;
 use std::f64::consts::{PI, TAU};
@@ -37,8 +37,46 @@ impl Default for FillOptions {
     }
 }
 
+/// Catmull-Rom sample of 16-bit RGB in 8-bit units (the synthesis works on a 0–255 scale).
+#[inline]
+fn sample_bicubic_u16(data: &[u16], w: usize, h: usize, x: f32, y: f32, wrap_x: bool) -> [f32; 3] {
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = fx.floor();
+    let y0 = fy.floor();
+    let cubic = |t: f32| {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        [-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2]
+    };
+    let wx = cubic(fx - x0);
+    let wy = cubic(fy - y0);
+    let (x0, y0) = (x0 as isize, y0 as isize);
+    let mut out = [0.0f32; 3];
+    for (j, wyj) in wy.iter().enumerate() {
+        let yy = (y0 - 1 + j as isize).clamp(0, h as isize - 1) as usize;
+        let mut row = [0.0f32; 3];
+        for (i, wxi) in wx.iter().enumerate() {
+            let xi = x0 - 1 + i as isize;
+            let xx = if wrap_x { xi.rem_euclid(w as isize) as usize } else { xi.clamp(0, w as isize - 1) as usize };
+            let p = &data[(yy * w + xx) * 3..(yy * w + xx) * 3 + 3];
+            row[0] += wxi * p[0] as f32;
+            row[1] += wxi * p[1] as f32;
+            row[2] += wxi * p[2] as f32;
+        }
+        out[0] += wyj * row[0];
+        out[1] += wyj * row[1];
+        out[2] += wyj * row[2];
+    }
+    [out[0] / 257.0, out[1] / 257.0, out[2] / 257.0]
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FillReport {
+    /// Share of the panorama that was filled, in percent.
+    pub filled_percent: f32,
+    /// Interior holes filled.
+    pub holes: usize,
     /// Radius of the filled cap in degrees, if a patch was made.
     pub zenith: Option<f32>,
     pub nadir: Option<f32>,
@@ -792,7 +830,7 @@ fn synthesise(pano: &Panorama, top: bool, gap_deg: f32, opts: &FillOptions) -> O
                         if !pano_alpha(pano, px, py) {
                             all = false;
                         }
-                        let c = sample_bicubic(&pano.rgb, pano.width, pano.height, px, py, true);
+                        let c = sample_bicubic_u16(&pano.rgb, pano.width, pano.height, px, py, true);
                         acc[0] += c[0];
                         acc[1] += c[1];
                         acc[2] += c[2];
@@ -1063,7 +1101,7 @@ fn apply(pano: &mut Panorama, syn: &Synthesis, gap_deg: f32) {
                 let qy = q.1 as f64 + 0.5 + (vy - (cy as f64 + 0.5));
                 let (qd, _) = view.dir(qx, qy);
                 let (px, py) = pano_coords(&source, qd);
-                let c = sample_bicubic(&source.rgb, w, h, px, py, true);
+                let c = sample_bicubic_u16(&source.rgb, w, h, px, py, true);
                 let bq = bilinear3(&syn.base, s, s, qx as f32, qy as f32);
                 let rho = syn.rho[(qy.clamp(0.0, (s - 1) as f64) as usize) * s + (qx.clamp(0.0, (s - 1) as f64) as usize)];
                 let ex = excess_shift([bp[0] - bq[0], bp[1] - bq[1], bp[2] - bq[2]], rho);
@@ -1104,7 +1142,7 @@ fn apply(pano: &mut Panorama, syn: &Synthesis, gap_deg: f32) {
             for c in 0..3 {
                 let orig = row[x * 3 + c] as f32;
                 let v = if covered { orig + (synth[c] - orig) * mix } else { synth[c] };
-                row[x * 3 + c] = (v + 0.5).clamp(0.0, 255.0) as u8;
+                row[x * 3 + c] = (v * 257.0 + 0.5).clamp(0.0, 65535.0) as u16;
             }
             arow[x] = 255;
         }
@@ -1146,5 +1184,15 @@ pub fn fill_poles(pano: &mut Panorama, opts: &FillOptions, progress: Progress) -
         }
     }
     progress(1.0, "Poles patched");
+    report
+}
+
+/// Fills every void: pole gaps of full spheres and holes between photos.
+pub fn fill_voids(pano: &mut Panorama, opts: &FillOptions, progress: Progress) -> FillReport {
+    let before = pano.alpha.par_iter().filter(|a| **a == 0).count();
+    let mut report = if pano.is_full_sphere() { fill_poles(pano, opts, &|f, s| progress(f * 0.5, s)) } else { FillReport::default() };
+    report.holes = crate::holes::fill_holes(pano, &|f, s| progress(0.5 + 0.5 * f, s));
+    let after = pano.alpha.par_iter().filter(|a| **a == 0).count();
+    report.filled_percent = 100.0 * before.saturating_sub(after) as f32 / (pano.width * pano.height).max(1) as f32;
     report
 }

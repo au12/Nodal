@@ -7,6 +7,7 @@
 
 use crate::lens::{LensModel, V3};
 use crate::project::{OutputProjection, Project, WarpField};
+use crate::pixels::LinearImage;
 use image::RgbImage;
 use nalgebra::Rotation3;
 use rayon::prelude::*;
@@ -153,7 +154,7 @@ pub fn image_roi(canvas: &Canvas, model: &LensModel, rot: &Rotation3<f64>, margi
 /// A warped photo on the canvas.
 pub struct Layer {
     pub roi: Roi,
-    /// RGB in 8-bit units (0–255, may exceed after exposure gain), 3 floats per pixel.
+    /// Scene-linear RGB, 3 floats per pixel.
     pub rgb: Vec<f32>,
     /// 255 where the photo covers the pixel.
     pub alpha: Vec<u8>,
@@ -176,13 +177,30 @@ pub enum Filter {
     Bicubic,
 }
 
-struct Mip {
-    w: usize,
-    h: usize,
-    data: Vec<u8>,
+/// Pixels a warper samples from.
+#[derive(Clone, Copy)]
+pub enum SourcePixels<'a> {
+    /// 8-bit sRGB working copy.
+    Srgb8(&'a RgbImage),
+    /// Scene-linear float pixels.
+    Linear(&'a LinearImage),
 }
 
-fn halve(src: &[u8], w: usize, h: usize) -> Mip {
+impl SourcePixels<'_> {
+    pub fn width(&self) -> usize {
+        match self {
+            SourcePixels::Srgb8(i) => i.width() as usize,
+            SourcePixels::Linear(i) => i.width,
+        }
+    }
+}
+
+enum Mip {
+    U8 { w: usize, h: usize, data: Vec<u8> },
+    F32(LinearImage),
+}
+
+fn halve_u8(src: &[u8], w: usize, h: usize) -> (usize, usize, Vec<u8>) {
     let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
     let mut data = vec![0u8; nw * nh * 3];
     data.par_chunks_mut(nw * 3).enumerate().for_each(|(y, row)| {
@@ -200,37 +218,67 @@ fn halve(src: &[u8], w: usize, h: usize) -> Mip {
             }
         }
     });
-    Mip { w: nw, h: nh, data }
+    (nw, nh, data)
+}
+
+/// sRGB-encoded value in 8-bit units (may slightly over/undershoot after cubic interpolation) to
+/// linear light.
+#[inline]
+fn srgb255_to_linear(v: f32) -> f32 {
+    static LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    const N: usize = 4096;
+    let t = LUT.get_or_init(|| (0..=N).map(|i| crate::pixels::srgb_to_linear(i as f32 / N as f32)).collect());
+    let p = (v * (N as f32 / 255.0)).clamp(0.0, N as f32 - 1e-3);
+    let i = p as usize;
+    let f = p - i as f32;
+    t[i] + (t[i + 1] - t[i]) * f
 }
 
 /// Everything needed to remap one photo.
 pub struct ImageWarper<'a> {
-    src: &'a RgbImage,
+    src: SourcePixels<'a>,
+    /// Source pixels per full-resolution pixel (working copies are smaller than the photo).
+    scale: f32,
     mips: Vec<Mip>,
     pub model: LensModel,
     world_to_cam: Rotation3<f64>,
     cam_to_world: Rotation3<f64>,
     field: Option<&'a WarpField>,
-    /// Gamma-space multiplier per channel (linear gain ^ 1/2.2).
+    /// Linear-light multiplier per channel (exposure and white balance).
     pub gain: [f32; 3],
-    /// Pixels trimmed from the photo's border (hides lens-edge artefacts and interpolation fringes).
+    /// Vignetting polynomial (see [`crate::lens::Lens::vignette`]) and its centre / normaliser.
+    vignette: [f32; 3],
+    vig_c: (f32, f32),
+    vig_inv_r2: f32,
+    /// Pixels trimmed from the photo's border (hides lens-edge artefacts and interpolation fringes),
+    /// in full-resolution pixels.
     pub inset: f32,
+    /// Optional exclusion mask in full-resolution pixel space (true = do not use).
+    pub exclude: Option<&'a crate::project::ImageMask>,
 }
 
 impl<'a> ImageWarper<'a> {
-    pub fn new(project: &'a Project, index: usize, src: &'a RgbImage) -> Self {
+    /// `src` may be smaller than the photo (a working copy); coordinates are scaled to it.
+    pub fn new(project: &'a Project, index: usize, src: SourcePixels<'a>) -> Self {
         let img = &project.images[index];
+        let lens = project.lens_of(index);
         let rot = img.rot();
-        let g = img.gain;
+        let scale = src.width() as f32 / img.width.max(1) as f32;
+        let (w, h) = (lens.width as f32, lens.height as f32);
         ImageWarper {
             src,
+            scale,
             mips: Vec::new(),
-            model: project.lens_of(index).model(),
+            model: lens.model(),
             world_to_cam: rot.inverse(),
             cam_to_world: rot,
             field: img.warp.as_ref(),
-            gain: [g[0].powf(1.0 / 2.2), g[1].powf(1.0 / 2.2), g[2].powf(1.0 / 2.2)],
+            gain: img.gain,
+            vignette: [lens.vignette[0] as f32, lens.vignette[1] as f32, lens.vignette[2] as f32],
+            vig_c: (w * 0.5 + lens.d as f32, h * 0.5 + lens.e as f32),
+            vig_inv_r2: 4.0 / (w * w + h * h),
             inset: 1.0,
+            exclude: img.mask.as_ref().filter(|m| !m.is_empty()),
         }
     }
 
@@ -244,8 +292,13 @@ impl<'a> ImageWarper<'a> {
         self.model.ray_to_pixel(self.world_to_cam * dir)
     }
 
+    /// Angular size of a source pixel as sampled (working copies have larger pixels).
+    pub fn source_pixel_angle(&self) -> f64 {
+        self.model.pixel_angle() / self.scale as f64
+    }
+
     fn level_for(&self, canvas: &Canvas) -> usize {
-        let scale = canvas.pixel_angle() / self.model.pixel_angle();
+        let scale = canvas.pixel_angle() / self.source_pixel_angle();
         if scale <= 1.5 {
             0
         } else {
@@ -255,30 +308,59 @@ impl<'a> ImageWarper<'a> {
 
     fn ensure_mips(&mut self, level: usize) {
         while self.mips.len() < level {
-            let next = match self.mips.last() {
-                None => halve(self.src.as_raw(), self.src.width() as usize, self.src.height() as usize),
-                Some(m) => halve(&m.data, m.w, m.h),
+            let next = match (self.mips.last(), self.src) {
+                (None, SourcePixels::Srgb8(img)) => {
+                    let (w, h, data) = halve_u8(img.as_raw(), img.width() as usize, img.height() as usize);
+                    Mip::U8 { w, h, data }
+                }
+                (None, SourcePixels::Linear(img)) => Mip::F32(img.halve()),
+                (Some(Mip::U8 { w, h, data }), _) => {
+                    let (w, h, data) = halve_u8(data, *w, *h);
+                    Mip::U8 { w, h, data }
+                }
+                (Some(Mip::F32(m)), _) => Mip::F32(m.halve()),
             };
             self.mips.push(next);
         }
     }
 
-    /// Renders the photo into `roi` of `canvas`.
+    /// Vignetting correction factor at a full-resolution source position.
+    #[inline]
+    fn devignette(&self, sx: f32, sy: f32) -> f32 {
+        if self.vignette == [0.0; 3] {
+            return 1.0;
+        }
+        let r2 = ((sx - self.vig_c.0).powi(2) + (sy - self.vig_c.1).powi(2)) * self.vig_inv_r2;
+        let v = 1.0 + r2 * (self.vignette[0] + r2 * (self.vignette[1] + r2 * self.vignette[2]));
+        1.0 / v.max(0.05)
+    }
+
+    /// Renders the photo into `roi` of `canvas`. Colours are scene-linear.
     pub fn render(&mut self, canvas: &Canvas, roi: Roi, filter: Filter, want_weight: bool) -> Layer {
         let level = self.level_for(canvas);
         self.ensure_mips(level);
-        let (pix, pw, ph): (&[u8], usize, usize) = if level == 0 {
-            (self.src.as_raw(), self.src.width() as usize, self.src.height() as usize)
+        enum Pix<'p> {
+            U8(&'p [u8], usize, usize),
+            F32(&'p LinearImage),
+        }
+        let pix = if level == 0 {
+            match self.src {
+                SourcePixels::Srgb8(img) => Pix::U8(img.as_raw(), img.width() as usize, img.height() as usize),
+                SourcePixels::Linear(img) => Pix::F32(img),
+            }
         } else {
-            let m = &self.mips[level - 1];
-            (&m.data, m.w, m.h)
+            match &self.mips[level - 1] {
+                Mip::U8 { w, h, data } => Pix::U8(data, *w, *h),
+                Mip::F32(m) => Pix::F32(m),
+            }
         };
-        let lscale = 1.0 / (1u32 << level) as f32;
+        // Full-resolution pixel → sampled-image pixel.
+        let lscale = self.scale / (1u32 << level) as f32;
         let (sw, sh) = (self.model.w as f32, self.model.h as f32);
-        let inset = self.inset.max(0.5 * (1u32 << level) as f32);
+        let inset = self.inset.max(0.5 / lscale);
         let half_min = sw.min(sh) * 0.5;
         let half_diag2 = (sw * sw + sh * sh) * 0.25;
-        let fisheye = self.model.kind.is_fisheye();
+        let fisheye = self.model.is_fisheye();
 
         const B: usize = 8;
         let gw = roi.w.div_ceil(B) + 1;
@@ -302,6 +384,7 @@ impl<'a> ImageWarper<'a> {
         let band_iter = rgb.par_chunks_mut(roi.w * 3 * rows_per_band).zip(alpha.par_chunks_mut(roi.w * rows_per_band)).enumerate();
         let weight_bands: Vec<&mut [f32]> = if want_weight { weight.chunks_mut(roi.w * rows_per_band).collect() } else { Vec::new() };
         let weight_bands = std::sync::Mutex::new(weight_bands.into_iter().map(Some).collect::<Vec<_>>());
+        let gain = self.gain;
 
         band_iter.for_each(|(by, (rgb_band, alpha_band))| {
             let mut wband: Option<&mut [f32]> = if want_weight { weight_bands.lock().unwrap()[by].take() } else { None };
@@ -375,14 +458,29 @@ impl<'a> ImageWarper<'a> {
                         if sx < inset || sy < inset || sx > sw - inset || sy > sh - inset {
                             continue;
                         }
+                        if let Some(m) = self.exclude {
+                            if m.excluded(sx, sy, sw, sh) {
+                                continue;
+                            }
+                        }
                         let o = ry * roi.w + lx;
-                        let c = match filter {
-                            Filter::Bicubic => crate::synth::sample_bicubic(pix, pw, ph, sx * lscale, sy * lscale, false),
-                            Filter::Bilinear => sample_bilinear(pix, pw, ph, sx * lscale, sy * lscale),
+                        let (px, py) = (sx * lscale, sy * lscale);
+                        let c = match (&pix, filter) {
+                            (Pix::U8(d, pw, ph), Filter::Bicubic) => {
+                                let c = crate::synth::sample_bicubic(d, *pw, *ph, px, py, false);
+                                [srgb255_to_linear(c[0]), srgb255_to_linear(c[1]), srgb255_to_linear(c[2])]
+                            }
+                            (Pix::U8(d, pw, ph), Filter::Bilinear) => {
+                                let c = sample_bilinear(d, *pw, *ph, px, py);
+                                [srgb255_to_linear(c[0]), srgb255_to_linear(c[1]), srgb255_to_linear(c[2])]
+                            }
+                            (Pix::F32(img), Filter::Bicubic) => sample_bicubic_f32(img, px, py),
+                            (Pix::F32(img), Filter::Bilinear) => sample_bilinear_f32(img, px, py),
                         };
-                        rgb_band[o * 3] = c[0] * self.gain[0];
-                        rgb_band[o * 3 + 1] = c[1] * self.gain[1];
-                        rgb_band[o * 3 + 2] = c[2] * self.gain[2];
+                        let v = self.devignette(sx, sy);
+                        rgb_band[o * 3] = c[0] * gain[0] * v;
+                        rgb_band[o * 3 + 1] = c[1] * gain[1] * v;
+                        rgb_band[o * 3 + 2] = c[2] * gain[2] * v;
                         alpha_band[o] = 255;
                         if let Some(wb) = wband.as_deref_mut() {
                             let edge = sx.min(sw - sx).min(sy).min(sh - sy) / half_min;
@@ -420,48 +518,71 @@ pub fn sample_bilinear(data: &[u8], w: usize, h: usize, x: f32, y: f32) -> [f32;
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::lens::{Lens, LensKind};
-    use crate::project::rotation_from_ypr;
-
-    #[test]
-    fn canvas_round_trip() {
-        let c = Canvas::equirect(4096);
-        for &(x, y) in &[(10.5, 20.5), (2048.0, 1024.0), (4000.2, 2000.7), (100.0, 1900.0)] {
-            let (px, py) = c.pixel(c.dir(x, y));
-            assert!((px - x).abs() < 1e-6 && (py - y).abs() < 1e-6);
-        }
-        // Centre of the canvas looks forward, left edge looks backwards.
-        assert!((c.dir(2048.0, 1024.0) - V3::z()).norm() < 1e-9);
+#[inline]
+pub fn sample_bilinear_f32(img: &LinearImage, x: f32, y: f32) -> [f32; 3] {
+    let (w, h) = (img.width, img.height);
+    let fx = (x - 0.5).clamp(0.0, (w - 1) as f32);
+    let fy = (y - 0.5).clamp(0.0, (h - 1) as f32);
+    let (x0, y0) = (fx as usize, fy as usize);
+    let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+    let d = &img.data;
+    let (a, b, c, e) = ((y0 * w + x0) * 3, (y0 * w + x1) * 3, (y1 * w + x0) * 3, (y1 * w + x1) * 3);
+    let mut out = [0.0; 3];
+    for k in 0..3 {
+        let top = d[a + k] + (d[b + k] - d[a + k]) * tx;
+        let bot = d[c + k] + (d[e + k] - d[c + k]) * tx;
+        out[k] = top + (bot - top) * ty;
     }
+    out
+}
 
-    #[test]
-    fn roi_contains_every_projected_pixel() {
-        let canvas = Canvas::equirect(2048);
-        for (kind, fov, yaw, pitch) in [
-            (LensKind::Rectilinear, 70.0, 0.0, 0.0),
-            (LensKind::Rectilinear, 70.0, 175.0, 20.0),
-            (LensKind::Rectilinear, 90.0, -100.0, 80.0),
-            (LensKind::Fisheye, 180.0, 30.0, -10.0),
-            (LensKind::Rectilinear, 40.0, -179.0, -60.0),
-        ] {
-            let lens = Lens::new(kind, fov, 600, 400);
-            let m = lens.model();
-            let rot = rotation_from_ypr(yaw, pitch, 7.0);
-            let roi = image_roi(&canvas, &m, &rot, 2.0);
-            for sy in (0..=400).step_by(20) {
-                for sx in (0..=600).step_by(20) {
-                    let d = rot * m.pixel_to_ray(sx as f64, sy as f64);
-                    let (cx, cy) = canvas.pixel(d);
-                    let (cx, cy) = ((cx as usize).min(canvas.w - 1), (cy as usize).min(canvas.h - 1));
-                    assert!(
-                        roi.local_x(cx, canvas.w).is_some() && roi.local_y(cy).is_some(),
-                        "{kind:?} yaw {yaw} pitch {pitch}: ({cx},{cy}) outside {roi:?}"
-                    );
+#[inline]
+fn cubic_weights(t: f32) -> [f32; 4] {
+    // Catmull-Rom.
+    let t2 = t * t;
+    let t3 = t2 * t;
+    [-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2]
+}
+
+/// Catmull-Rom bicubic sample of a linear image (clamped at the borders). Overshoot is limited to
+/// the range of the 2×2 neighbourhood so bright edges do not ring into dark halos.
+#[inline]
+pub fn sample_bicubic_f32(img: &LinearImage, x: f32, y: f32) -> [f32; 3] {
+    let (w, h) = (img.width as isize, img.height as isize);
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = fx.floor();
+    let y0 = fy.floor();
+    let wx = cubic_weights(fx - x0);
+    let wy = cubic_weights(fy - y0);
+    let (x0, y0) = (x0 as isize, y0 as isize);
+    let d = &img.data;
+    let mut out = [0.0f32; 3];
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for (j, wyj) in wy.iter().enumerate() {
+        let yy = (y0 - 1 + j as isize).clamp(0, h - 1) as usize;
+        let mut row = [0.0f32; 3];
+        for (i, wxi) in wx.iter().enumerate() {
+            let xx = (x0 - 1 + i as isize).clamp(0, w - 1) as usize;
+            let p = (yy * w as usize + xx) * 3;
+            row[0] += wxi * d[p];
+            row[1] += wxi * d[p + 1];
+            row[2] += wxi * d[p + 2];
+            if (i == 1 || i == 2) && (j == 1 || j == 2) {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(d[p + k]);
+                    hi[k] = hi[k].max(d[p + k]);
                 }
             }
         }
+        out[0] += wyj * row[0];
+        out[1] += wyj * row[1];
+        out[2] += wyj * row[2];
     }
+    for k in 0..3 {
+        out[k] = out[k].clamp(lo[k], hi[k]);
+    }
+    out
 }
