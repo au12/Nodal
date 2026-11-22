@@ -543,20 +543,23 @@ pub fn render(project: &Project, pixels: &dyn PixelProvider, opts: &RenderOption
     let profile = std::env::var_os("NODAL_PROFILE").is_some();
     let mut blender = Blender::new(bw, bh, bands);
     let a = align as i64;
-    // Which images need decoding at full resolution: only where the canvas is finer than the
-    // working copy.
+    // Which images need decoding, and at what resolution: only where the canvas is finer than
+    // the working copy, and at half resolution when that is still at least as fine as the canvas.
     let needs_full = |i: usize| {
         let lens = proj.lens_of(i);
         let work_w = working[i].as_ref().map(|w| w.width()).unwrap_or(1) as f64;
         let work_angle = lens.model().pixel_angle() * proj.images[i].width as f64 / work_w;
         canvas.pixel_angle() < work_angle * 1.3
     };
+    let half_is_enough = |i: usize| canvas.pixel_angle() >= 1.9 * proj.lens_of(i).model().pixel_angle();
     let order: Vec<(usize, usize)> = active.iter().enumerate().filter(|(k, _)| rois[*k].is_some()).map(|(k, &i)| (k, i)).collect();
     let load = |i: usize| -> Result<Option<Arc<LinearImage>>> {
-        if needs_full(i) {
-            pixels.full(i, &proj.develop).map(Some)
-        } else {
+        if !needs_full(i) {
             Ok(None)
+        } else if half_is_enough(i) {
+            pixels.half(i, &proj.develop).map(Some)
+        } else {
+            pixels.full(i, &proj.develop).map(Some)
         }
     };
     // Decode the next photo on another thread while the current one is warped and blended.

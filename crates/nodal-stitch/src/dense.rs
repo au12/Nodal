@@ -581,7 +581,35 @@ fn overlap_pairs(project: &Project) -> Vec<(usize, usize, V3, f64, Vec<V3>)> {
 
 /// Dense matches for every overlapping pair under the project's current model.
 pub fn register(project: &Project, lumas: &[Option<LumaImage>], progress: Progress) -> Vec<DenseMatch> {
-    let pairs = overlap_pairs(project);
+    let mut pairs = overlap_pairs(project);
+    // Redundant handheld sets overlap many ways: measure the substantial overlaps, plus each
+    // photo's three largest so every photo stays well connected.
+    {
+        let n = project.images.len();
+        let mut per: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+        for (k, p) in pairs.iter().enumerate() {
+            per[p.0].push((p.4.len(), k));
+            per[p.1].push((p.4.len(), k));
+        }
+        let mut keep = vec![false; pairs.len()];
+        for list in per.iter_mut() {
+            list.sort_by(|a, b| b.0.cmp(&a.0));
+            for &(_, k) in list.iter().take(3) {
+                keep[k] = true;
+            }
+        }
+        const N: usize = 24;
+        for (k, p) in pairs.iter().enumerate() {
+            if p.4.len() >= N * N * 18 / 100 {
+                keep[k] = true;
+            }
+        }
+        let mut k = 0;
+        pairs.retain(|_| {
+            k += 1;
+            keep[k - 1]
+        });
+    }
     let models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
     let rots: Vec<Rotation3<f64>> = project.images.iter().map(|i| i.rot()).collect();
     let done = AtomicUsize::new(0);
@@ -624,7 +652,7 @@ pub fn register(project: &Project, lumas: &[Option<LumaImage>], progress: Progre
             // Grid spacing of the overlap sample is ~1/24 of the frame: pad by that much.
             let pad = 0.06 * (u1 - u0).max(v1 - v0);
             let (u0, u1, v0, v1) = (u0 - pad, u1 + pad, v0 - pad, v1 + pad);
-            const MAX_SIDE: f64 = 1800.0;
+            const MAX_SIDE: f64 = 1400.0;
             let longest = (u1 - u0).max(v1 - v0) * f;
             if longest > MAX_SIDE {
                 f *= MAX_SIDE / longest;
@@ -649,7 +677,7 @@ pub fn register(project: &Project, lumas: &[Option<LumaImage>], progress: Progre
             }
             let debug = std::env::var("NODAL_DENSE_DEBUG").ok().filter(|v| v == &format!("{i}-{j}"));
             let dbg_planes = debug.as_ref().map(|_| (pa.clone(), pb.clone()));
-            let raw = match_planes(pa, pb, 12, 4);
+            let raw = match_planes(pa, pb, 16, 4);
             let _ = centre;
             if let Some((da, db)) = dbg_planes {
                 let save = |p: &Plane, name: &str| {
@@ -763,7 +791,9 @@ pub fn refine_project(project: &mut Project, sources: &[Source], opts: &AlignOpt
         .map(|i| (project.images[i].aligned && project.images[i].enabled).then(|| LumaImage::from_source(&sources[i])))
         .collect();
     progress(0.0, "Measuring overlaps");
+    let t0 = std::time::Instant::now();
     let matches = register(project, &lumas, &|f, s| progress(f * 0.6, s));
+    let t_register = t0.elapsed().as_secs_f32();
     drop(lumas);
     report.matches = matches.len();
     report.pairs = {
@@ -783,7 +813,9 @@ pub fn refine_project(project: &mut Project, sources: &[Source], opts: &AlignOpt
     let dense_cps = to_control_points(project, &matches, 60);
     let saved = project.control_points.clone();
     project.control_points.extend(dense_cps.iter().copied());
+    let t1 = std::time::Instant::now();
     crate::align::polish(project, opts);
+    let t_polish = t1.elapsed().as_secs_f32();
     project.control_points = saved;
     project.control_points.extend(dense_cps);
     crate::optimize::update_errors(project);
@@ -799,7 +831,11 @@ pub fn refine_project(project: &mut Project, sources: &[Source], opts: &AlignOpt
     // Local warps for the parallax the global model cannot explain.
     if project.output.local_alignment {
         progress(0.8, "Correcting parallax");
+        let t2 = std::time::Instant::now();
         let warped = crate::local::fit_dense(project, &matches);
+        if std::env::var_os("NODAL_PROFILE").is_some() {
+            eprintln!("dense: register {t_register:.2}s polish {t_polish:.2}s warps {:.2}s", t2.elapsed().as_secs_f32());
+        }
         report.images_warped = warped;
         let (rms2, med2, p90_2) = stats(matches.par_iter().map(|m| residual(project, m, true)).collect());
         report.rms_warped = rms2;

@@ -197,6 +197,11 @@ pub trait PixelProvider: Sync {
     fn working(&self, i: usize) -> Arc<RgbImage>;
     /// Full-resolution scene-linear pixels of project image `i`.
     fn full(&self, i: usize, develop: &project::Develop) -> Result<Arc<LinearImage>>;
+    /// Scene-linear pixels at about half resolution (RAW files decode several times faster this
+    /// way). Used when the output is not fine enough to need every photo pixel.
+    fn half(&self, i: usize, develop: &project::Develop) -> Result<Arc<LinearImage>> {
+        self.full(i, develop)
+    }
     /// Path of image `i` (for messages).
     fn path(&self, i: usize) -> &Path;
 }
@@ -221,6 +226,17 @@ impl PixelProvider for [Source] {
         Ok(Arc::new(img))
     }
 
+    fn half(&self, i: usize, develop: &project::Develop) -> Result<Arc<LinearImage>> {
+        let s = &self[i];
+        if s.full.is_some() || s.kind != decode::SourceKind::Raw {
+            return self.full(i, develop);
+        }
+        let long = s.width.max(s.height);
+        let settings = decode::DecodeSettings { max_dim: long / 2, white_balance: develop.white_balance.or(s.white_balance) };
+        let (img, _) = decode::decode_linear(&s.path, &settings).map_err(|e| e.context(format!("could not load {}", s.path.display())))?;
+        Ok(Arc::new(img))
+    }
+
     fn path(&self, i: usize) -> &Path {
         &self[i].path
     }
@@ -232,6 +248,9 @@ impl PixelProvider for Vec<Source> {
     }
     fn full(&self, i: usize, develop: &project::Develop) -> Result<Arc<LinearImage>> {
         self.as_slice().full(i, develop)
+    }
+    fn half(&self, i: usize, develop: &project::Develop) -> Result<Arc<LinearImage>> {
+        self.as_slice().half(i, develop)
     }
     fn path(&self, i: usize) -> &Path {
         self.as_slice().path(i)
@@ -286,10 +305,17 @@ pub fn align_sources(sources: &[Source], opts: &AlignOptions, progress: Progress
     let mut project = align::new_project(&meta);
     project.develop.white_balance = sources.iter().find_map(|s| s.white_balance);
     let feats: Vec<FeatureSet> = sources.iter().map(|s| (*s.features).clone()).collect();
+    let mut clock = std::time::Instant::now();
+    let mut lap = |report: &mut AlignReport, name: &str| {
+        report.timings.push((name.to_string(), clock.elapsed().as_secs_f32()));
+        clock = std::time::Instant::now();
+    };
     let mut report = align::align(&mut project, &feats, &AlignOptions { level: false, ..opts.clone() }, &|f, s| progress(f * 0.6, s))?;
-    let lumas: Vec<refine::Luma> = sources.par_iter().map(|s| refine::Luma::from_rgb_scaled(&s.image, s.work_scale())).collect();
+    lap(&mut report, "match + global alignment");
     // Polish control points on the working copies, then re-optimise with the sharper measurements.
-    if project.control_points.len() >= 12 {
+    // Dense registration supersedes this (it measures sub-pixel correspondences everywhere).
+    if project.control_points.len() >= 12 && !opts.dense {
+        let lumas: Vec<refine::Luma> = sources.par_iter().map(|s| refine::Luma::from_rgb_scaled(&s.image, s.work_scale())).collect();
         progress(0.62, "Refining control points");
         let before = report.rms;
         let search = ((report.rms * 2.5).ceil() as i32).clamp(3, 12);
@@ -309,6 +335,7 @@ pub fn align_sources(sources: &[Source], opts: &AlignOptions, progress: Progress
     if opts.level {
         align::level(&mut project);
     }
+    lap(&mut report, "control point refinement");
     // Dense registration of every overlap: thousands of evenly spread measurements for a second
     // adjustment, and the parallax that remains for the local warps and seams.
     if opts.dense && project.active().count() >= 2 {
@@ -327,8 +354,10 @@ pub fn align_sources(sources: &[Source], opts: &AlignOptions, progress: Progress
         }
         report.local = Some(local);
     }
+    lap(&mut report, "dense registration + warps");
     progress(0.92, "Calibrating exposure");
     let photo = photometric::calibrate(&mut project, sources);
+    lap(&mut report, "photometric calibration");
     report.log.push(photo.summary());
     report.photometric = Some(photo);
     progress(1.0, "Aligned");
