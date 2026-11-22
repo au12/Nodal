@@ -15,6 +15,7 @@ pub mod decode;
 pub mod dense;
 pub mod features;
 pub mod fill;
+pub mod global;
 pub mod holes;
 pub mod io;
 pub mod lens;
@@ -74,6 +75,8 @@ pub struct Source {
     /// Full-resolution pixels kept in memory (synthetic and in-memory sources). File sources leave
     /// this empty and are decoded again when rendering.
     pub full: Option<Arc<LinearImage>>,
+    /// RAW white balance used for this set (shared by every RAW frame).
+    pub white_balance: Option<[f32; 3]>,
 }
 
 impl Source {
@@ -97,6 +100,7 @@ impl Source {
             kind: decode::SourceKind::Other,
             features: Arc::new(features),
             full: Some(Arc::new(full)),
+            white_balance: None,
         }
     }
 
@@ -116,6 +120,7 @@ impl Source {
             kind: decode::SourceKind::Other,
             features: Arc::new(features),
             full: Some(Arc::new(full)),
+            white_balance: None,
         }
     }
 }
@@ -179,6 +184,7 @@ pub fn load_sources_with(
                     kind: info.kind,
                     features: Arc::new(features),
                     full: None,
+                    white_balance: if info.kind == decode::SourceKind::Raw { wb } else { None },
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -206,7 +212,7 @@ impl PixelProvider for [Source] {
         if let Some(f) = &s.full {
             return Ok(f.clone());
         }
-        let settings = decode::DecodeSettings { max_dim: 0, white_balance: develop.white_balance };
+        let settings = decode::DecodeSettings { max_dim: 0, white_balance: develop.white_balance.or(s.white_balance) };
         let (img, _) = decode::decode_linear(&s.path, &settings).map_err(|e| e.context(format!("could not load {}", s.path.display())))?;
         anyhow::ensure!(
             img.width as u32 == s.width && img.height as u32 == s.height,
@@ -234,6 +240,31 @@ impl PixelProvider for Vec<Source> {
 }
 
 /// In-memory 8-bit images (each both working copy and full resolution).
+impl PixelProvider for [Arc<RgbImage>] {
+    fn working(&self, i: usize) -> Arc<RgbImage> {
+        self[i].clone()
+    }
+    fn full(&self, i: usize, _: &project::Develop) -> Result<Arc<LinearImage>> {
+        Ok(Arc::new(LinearImage::from_srgb8(&self[i])))
+    }
+    fn path(&self, _: usize) -> &Path {
+        Path::new("")
+    }
+}
+
+impl PixelProvider for Vec<Arc<RgbImage>> {
+    fn working(&self, i: usize) -> Arc<RgbImage> {
+        self[i].clone()
+    }
+    fn full(&self, i: usize, d: &project::Develop) -> Result<Arc<LinearImage>> {
+        self.as_slice().full(i, d)
+    }
+    fn path(&self, _: usize) -> &Path {
+        Path::new("")
+    }
+}
+
+/// In-memory 8-bit images (each both working copy and full resolution).
 pub struct MemoryPixels(pub Vec<Arc<RgbImage>>);
 
 impl PixelProvider for MemoryPixels {
@@ -254,6 +285,7 @@ impl PixelProvider for MemoryPixels {
 pub fn align_sources(sources: &[Source], opts: &AlignOptions, progress: Progress) -> Result<(Project, AlignReport)> {
     let meta: Vec<_> = sources.iter().map(|s| (s.path.clone(), s.width, s.height, s.exif.clone())).collect();
     let mut project = align::new_project(&meta);
+    project.develop.white_balance = sources.iter().find_map(|s| s.white_balance);
     let feats: Vec<FeatureSet> = sources.iter().map(|s| (*s.features).clone()).collect();
     let mut report = align::align(&mut project, &feats, &AlignOptions { level: false, ..opts.clone() }, &|f, s| progress(f * 0.6, s))?;
     let lumas: Vec<refine::Luma> = sources.par_iter().map(|s| refine::Luma::from_rgb_scaled(&s.image, s.work_scale())).collect();

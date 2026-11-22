@@ -5,7 +5,7 @@
 // feather-blended. Used for instant feedback while re-centring or levelling a panorama.
 
 struct Photo {
-    r0: vec4<f32>,      // world→camera rotation row 0 (xyz), lens kind (w)
+    r0: vec4<f32>,      // world→camera rotation row 0 (xyz), projection factor k (w)
     r1: vec4<f32>,      // row 1 (xyz), focal length in pixels (w)
     r2: vec4<f32>,      // row 2 (xyz), normalisation radius in pixels (w)
     centre: vec4<f32>,  // principal point x, y; image width, height (pixels)
@@ -40,15 +40,15 @@ fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> VsOut {
     return o;
 }
 
-fn ideal_radius(kind: f32, theta: f32) -> f32 {
-    if (kind < 0.5) {
-        return tan(theta);
-    } else if (kind < 1.5) {
+// Ideal radius in focal lengths for the one-parameter projection family (PTGui's fisheye
+// factor): k = 1 rectilinear, 0.5 stereographic, 0 equidistant, -0.5 equisolid.
+fn ideal_radius(k: f32, theta: f32) -> f32 {
+    if (abs(k) < 1e-6) {
         return theta;
-    } else if (kind < 2.5) {
-        return 2.0 * sin(theta * 0.5);
+    } else if (k > 0.0) {
+        return tan(k * theta) / k;
     }
-    return 2.0 * tan(theta * 0.5);
+    return sin(k * theta) / k;
 }
 
 fn to_srgb(c: vec3<f32>) -> vec3<f32> {

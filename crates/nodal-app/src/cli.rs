@@ -226,7 +226,10 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
         } => {
             use nodal_stitch::{features::DetectOptions, project::PoleFill, AlignOptions, LensKind, RenderOptions};
             let ext = out.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            anyhow::ensure!(matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "tif" | "tiff"), "output must be a .jpg, .png or .tif file");
+            anyhow::ensure!(
+                matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "tif" | "tiff" | "psd" | "psb"),
+                "output must be a .jpg (8-bit), .tif, .png or .psd (16-bit) file"
+            );
             let lens = match (lens.as_deref(), hfov) {
                 (None, None) => None,
                 (kind, fov) => {
@@ -263,8 +266,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             proj.output.pole_fill = if no_fill { PoleFill::Off } else { PoleFill::Auto };
             proj.output.nadir_patch = nadir_patch;
             proj.output.zenith_patch = zenith_patch;
-            let pixels: Vec<_> = sources.iter().map(|s| s.image.clone()).collect();
-            let pano = nodal_stitch::render(&proj, &pixels, &RenderOptions::default(), &|f, s| show(0.5 + f * 0.5, s))?;
+            let pano = nodal_stitch::render(&proj, &sources, &RenderOptions::default(), &|f, s| show(0.5 + f * 0.5, s))?;
             end_line();
             nodal_stitch::io::save_panorama(&pano, &out, quality)?;
 
@@ -274,7 +276,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                 let n = proj.images.iter().filter(|img| img.lens == i).count();
                 println!(
                     "  lens: {} {:.1}° ({:.0} mm equiv.), distortion a {:+.4} b {:+.4} c {:+.4}  [{n} photos]",
-                    l.kind.label().to_lowercase(),
+                    l.projection_label().to_lowercase(),
                     l.hfov,
                     l.focal_35mm(),
                     l.a,
@@ -291,6 +293,18 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             );
             if let Some(local) = report.local.filter(|l| l.images_warped > 0) {
                 println!("  local alignment: RMS {:.2} → {:.2} px", local.before, local.after);
+            }
+            if let Some(d) = &report.dense {
+                println!(
+                    "  dense registration: {} pairs, misregistration median {:.2} px, 90 % under {:.2} px{}",
+                    d.pairs,
+                    if d.images_warped > 0 { d.median_warped } else { d.median_after },
+                    if d.images_warped > 0 { d.p90_warped } else { d.p90_after },
+                    if d.images_warped > 0 { format!(" (local warps on {} photos)", d.images_warped) } else { String::new() }
+                );
+            }
+            if let Some(ph) = &report.photometric {
+                println!("  {}", ph.summary().to_lowercase());
             }
             let (hf, vf, _) = pano.coverage_degrees();
             if pano.is_full_sphere() {
@@ -413,7 +427,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
 
 /// Stitches a synthetic photo set with known ground truth and reports timings and accuracy.
 fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
-    use nodal_stitch::features::{detect, DetectOptions};
+    use nodal_stitch::features::DetectOptions;
     use nodal_stitch::project::{rotation_from_ypr, PoleFill};
     use nodal_stitch::synth::{procedural_pano, render_shot, ShotOptions};
     use nodal_stitch::{AlignOptions, Lens, LensKind, RenderOptions, Source};
@@ -465,12 +479,7 @@ fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
     let sources: Vec<Source> = shots
         .par_iter()
         .enumerate()
-        .map(|(i, s)| Source {
-            path: format!("bench{i}.jpg").into(),
-            image: s.clone(),
-            exif: Default::default(),
-            features: Arc::new(detect(s.as_raw(), s.width() as usize, s.height() as usize, &DetectOptions::default())),
-        })
+        .map(|(i, s)| Source::from_rgb8(format!("bench{i}.jpg"), s.clone(), Default::default(), &DetectOptions::default()))
         .collect();
     let t_features = t0.elapsed().as_secs_f32();
 
@@ -483,7 +492,7 @@ fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
     proj.output.pole_fill = PoleFill::Auto;
     proj.output.nadir_patch = 20.0; // exercise the pole patcher too
     let t = Instant::now();
-    let pano = nodal_stitch::render(&proj, &shots, &RenderOptions::default(), &|_, _| {})?;
+    let pano = nodal_stitch::render(&proj, &sources, &RenderOptions::default(), &|_, _| {})?;
     let t_render = t.elapsed().as_secs_f32();
 
     let total_mp = poses.len() as f32 * (sw * sh) as f32 / 1e6;
@@ -505,7 +514,7 @@ fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
     println!("  total:               {:6.2} s", t_features + t_align + t_render);
     println!(
         "  accuracy: lens {} {:.2}° (true: fisheye {true_fov:.2}°), {} photos aligned",
-        est.kind.label().to_lowercase(),
+        est.projection_label().to_lowercase(),
         est.hfov,
         proj.images.iter().filter(|i| i.aligned).count()
     );

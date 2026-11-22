@@ -236,6 +236,8 @@ fn decode_raw(path: &Path, settings: &DecodeSettings) -> Result<(LinearImage, Im
         output: OutputFormat::LinearRgbF32,
         demosaic: if half { Demosaic::HalfSize } else { Demosaic::Auto },
         crop: false,
+        // Clipped highlights fade to white instead of turning magenta or cyan.
+        highlights: flashraw::Highlights::Blend,
         ..Default::default()
     };
     if let Some(wb) = settings.white_balance {

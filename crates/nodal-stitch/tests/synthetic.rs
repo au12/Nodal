@@ -73,7 +73,7 @@ fn psnr(scene: &Scene, pano: &nodal_stitch::Panorama) -> (f64, f64) {
             let gy = fy * gh as f32 / pano.full_height as f32;
             let t = sample_bicubic(scene.pano.as_raw(), gw, gh, gx, gy, true);
             for (c, tc) in t.iter().enumerate() {
-                let d = pano.rgb[o * 3 + c] as f64 - *tc as f64;
+                let d = pano.rgb[o * 3 + c] as f64 / 257.0 - *tc as f64;
                 se += d * d;
             }
             n += 3;
@@ -145,24 +145,14 @@ fn pole_gaps_are_filled_seamlessly() {
             rgb[y * w * 3..(y + 1) * w * 3].fill(0);
         }
     }
-    let mut pano = nodal_stitch::Panorama {
-        width: w,
-        height: h,
-        rgb,
-        alpha,
-        full_width: w,
-        full_height: h,
-        crop_x: 0,
-        crop_y: 0,
-        stats: Default::default(),
-    };
+    let mut pano = nodal_stitch::Panorama::from_rgb8(w, h, &rgb, alpha);
     assert!((pole_gap(&pano, true, 62.0).unwrap() - zenith).abs() < 1.0);
     let report = fill_poles(&mut pano, &FillOptions::default(), &|_, _| {});
     assert!(report.zenith.is_some() && report.nadir.is_some(), "{report:?}");
     assert!(!pano.has_gaps(), "every pixel must be filled");
     // Untouched outside the patched caps (a few degrees of cross-fade allowed).
     for y in (h * 30 / 180)..(h * 145 / 180) {
-        assert_eq!(&pano.rgb[y * w * 3..(y + 1) * w * 3], &truth.as_raw()[y * w * 3..(y + 1) * w * 3], "row {y} changed");
+        assert_eq!(&pano.rgb8()[y * w * 3..(y + 1) * w * 3], &truth.as_raw()[y * w * 3..(y + 1) * w * 3], "row {y} changed");
     }
     // The patch has the same overall tone and texture strength as the material around it.
     let stats = |img: &[u8], y0: usize, y1: usize| {
@@ -172,7 +162,7 @@ fn pole_gaps_are_filled_seamlessly() {
         (mean, var.sqrt())
     };
     for (y0, y1) in [(0, h * 16 / 180), (h * 156 / 180, h)] {
-        let (m_fill, s_fill) = stats(&pano.rgb, y0, y1);
+        let (m_fill, s_fill) = stats(&pano.rgb8(), y0, y1);
         let (m_true, s_true) = stats(truth.as_raw(), y0, y1);
         // The hidden cap can only be guessed, so this is a sanity bound, not an accuracy claim.
         assert!((m_fill - m_true).abs() < 35.0, "tone {m_fill:.1} vs {m_true:.1}");

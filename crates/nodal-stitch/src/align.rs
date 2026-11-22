@@ -458,30 +458,146 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
         "No overlapping images were found. Check that the photos overlap by at least 20–30 % and that the lens type is right."
     );
 
-    // 4. Initial orientations: grow a maximum spanning tree from the best-connected image.
+    // 4. Global placement: robust rotation averaging over every verified pair, with a focal-length
+    //    search by global consistency (a ring only closes at the right focal length) and removal of
+    //    pairs that contradict the cycles they belong to.
     progress(0.5, "Placing images");
-    let comp = connected(&verified);
-    let mut comp_weight = std::collections::HashMap::<usize, usize>::new();
     let mut degree = vec![0usize; n];
     for (p, fit) in &verified {
-        *comp_weight.entry(comp[p.a]).or_default() += fit.inliers.len();
         degree[p.a] += fit.inliers.len();
         degree[p.b] += fit.inliers.len();
     }
+    let comp0 = connected(&verified);
+    let mut comp_weight = std::collections::HashMap::<usize, usize>::new();
+    for (p, fit) in &verified {
+        *comp_weight.entry(comp0[p.a]).or_default() += fit.inliers.len();
+    }
     let main = *comp_weight.iter().max_by_key(|(c, w)| (**w, usize::MAX - **c)).unwrap().0;
-    let anchor = (0..n).filter(|&i| comp[i] == main).max_by_key(|&i| (degree[i], usize::MAX - i)).unwrap();
-    let mut rots: Vec<Option<Rotation3<f64>>> = vec![None; n];
-    rots[anchor] = Some(Rotation3::identity());
-    loop {
-        // Strongest edge leaving the placed set.
-        let next = verified.iter().filter(|(p, _)| rots[p.a].is_some() != rots[p.b].is_some()).max_by_key(|(_, f)| f.inliers.len());
-        let Some((p, fit)) = next else { break };
-        if let Some(ra) = rots[p.a] {
-            rots[p.b] = Some(ra * fit.r);
-        } else {
-            rots[p.a] = Some(rots[p.b].unwrap() * fit.r.inverse());
+    let anchor = (0..n).filter(|&i| comp0[i] == main).max_by_key(|&i| (degree[i], usize::MAX - i)).unwrap();
+    let pair_points: Vec<crate::global::PairPoints> = verified
+        .iter()
+        .map(|(p, fit)| crate::global::PairPoints {
+            a: p.a,
+            b: p.b,
+            pts: fit
+                .inliers
+                .iter()
+                .map(|&k| {
+                    let m = p.raw[k];
+                    let (fa, fb) = (&features[p.a].feats[m.a as usize], &features[p.b].feats[m.b as usize]);
+                    (fa.x, fa.y, fb.x, fb.y)
+                })
+                .collect(),
+        })
+        .collect();
+    let lens_idx: Vec<usize> = project.images.iter().map(|i| i.lens).collect();
+    let mut searched = vec![false; project.lenses.len()];
+    if opts.lens.is_none() && opts.optimize_lens {
+        for li in 0..project.lenses.len() {
+            if !lens_idx.contains(&li) {
+                continue;
+            }
+            let base = project.lenses[li];
+            let f0 = base.focal_px();
+            let eval_full = |f: f64| {
+                let mut models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
+                let mut l = base;
+                l.set_focal_px(f);
+                models[li] = l.model();
+                crate::global::consistency_cost(n, &pair_points, &models, &lens_idx, anchor)
+            };
+            let eval = |f: f64| eval_full(f).0;
+            // The focal length is only well determined by global consistency when the photos close
+            // a ring: elsewhere it trades off against the spacing of the shots.
+            let (_, rots0) = eval_full(f0);
+            let mut yaws: Vec<f64> = rots0
+                .iter()
+                .flatten()
+                .map(|r| r * V3::z())
+                .filter(|d| d.y.abs() < 0.85)
+                .map(|d| d.x.atan2(d.z))
+                .collect();
+            yaws.sort_by(|a, b| a.total_cmp(b));
+            let ring = yaws.len() >= 4 && {
+                let mut gap = yaws[0] + std::f64::consts::TAU - yaws[yaws.len() - 1];
+                for w in yaws.windows(2) {
+                    gap = gap.max(w[1] - w[0]);
+                }
+                gap < 100f64.to_radians()
+            };
+            if !ring {
+                continue;
+            }
+            // Coarse logarithmic grid, ±40 %, then golden-section refinement.
+            let grid: Vec<f64> = (0..=28).map(|k| f0 * (0.7f64.ln() + (1.45f64.ln() - 0.7f64.ln()) * k as f64 / 28.0).exp()).collect();
+            let costs: Vec<f64> = grid.par_iter().map(|&f| eval(f)).collect();
+            let (kbest, _) = costs.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+            let (mut lo, mut hi) = (grid[kbest.saturating_sub(1)], grid[(kbest + 1).min(grid.len() - 1)]);
+            let g = 0.5 * (5f64.sqrt() - 1.0);
+            let (mut x1, mut x2) = (hi - g * (hi - lo), lo + g * (hi - lo));
+            let (mut c1, mut c2) = (eval(x1), eval(x2));
+            for _ in 0..14 {
+                if c1 < c2 {
+                    hi = x2;
+                    x2 = x1;
+                    c2 = c1;
+                    x1 = hi - g * (hi - lo);
+                    c1 = eval(x1);
+                } else {
+                    lo = x1;
+                    x1 = x2;
+                    c1 = c2;
+                    x2 = lo + g * (hi - lo);
+                    c2 = eval(x2);
+                }
+            }
+            let f_best = 0.5 * (lo + hi);
+            // Only trust a clear optimum (a flat cost means the focal length is unobservable).
+            let c_best = eval(f_best);
+            let c_far = costs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if c_far > c_best * 1.05 {
+                let before = base.hfov;
+                project.lenses[li].set_focal_px(f_best);
+                searched[li] = true;
+                report.log.push(format!(
+                    "Lens {}: focal length {:.0} px ({:.1}° wide) from global consistency (started at {:.1}°)",
+                    li + 1,
+                    f_best,
+                    project.lenses[li].hfov,
+                    before
+                ));
+            }
         }
     }
+    let models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
+    let edges: Vec<crate::global::Edge> = pair_points
+        .iter()
+        .map(|p| {
+            let (ma, mb) = (&models[lens_idx[p.a]], &models[lens_idx[p.b]]);
+            let rays: Vec<(V3, V3)> =
+                p.pts.iter().map(|&(ax, ay, bx, by)| (ma.pixel_to_ray(ax as f64, ay as f64), mb.pixel_to_ray(bx as f64, by as f64))).collect();
+            let r = crate::matching::kabsch(rays.iter().copied()).unwrap_or_else(Rotation3::identity);
+            crate::global::Edge { a: p.a, b: p.b, r, w: (p.pts.len() as f64).sqrt() }
+        })
+        .collect();
+    let (rots, keep_edge, residuals) = crate::global::average_robust(n, &edges, anchor);
+    let dropped: Vec<String> = edges
+        .iter()
+        .zip(&keep_edge)
+        .zip(&residuals)
+        .filter(|((_, k), _)| !**k)
+        .map(|((e, _), r)| format!("{}–{} ({:.1}°)", e.a + 1, e.b + 1, r.to_degrees()))
+        .collect();
+    if !dropped.is_empty() {
+        report.log.push(format!("Dropped {} inconsistent pair(s): {}", dropped.len(), dropped.join(", ")));
+    }
+    let mut k = 0;
+    verified.retain(|_| {
+        let keep = keep_edge[k];
+        k += 1;
+        keep
+    });
+    report.pairs.retain(|ps| verified.iter().any(|(p, _)| p.a == ps.a && p.b == ps.b));
     for i in 0..n {
         if let Some(r) = rots[i] {
             project.images[i].set_rot(&r);
@@ -517,9 +633,12 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
         .lenses
         .iter()
         .zip(&report.lens_source)
-        .map(|(l, src)| match src {
-            LensSource::Exif => Some((l.hfov, (l.hfov * 0.04).max(0.5))),
+        .zip(&searched)
+        .map(|((l, src), &found)| match src {
             LensSource::User => Some((l.hfov, (l.hfov * 0.01).max(0.1))),
+            _ if found => Some((l.hfov, (l.hfov * 0.05).max(0.5))),
+            // Zoom lenses often differ from their EXIF focal length by 5–10 %.
+            LensSource::Exif => Some((l.hfov, (l.hfov * 0.12).max(1.0))),
             LensSource::Estimated => Some((l.hfov, l.hfov * 0.5)),
         })
         .collect();

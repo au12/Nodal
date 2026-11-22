@@ -55,6 +55,7 @@ enum Format {
     Jpeg,
     Tiff,
     Png,
+    Psd,
 }
 
 impl Format {
@@ -63,6 +64,7 @@ impl Format {
             Format::Jpeg => "jpg",
             Format::Tiff => "tif",
             Format::Png => "png",
+            Format::Psd => "psd",
         }
     }
 }
@@ -173,17 +175,14 @@ impl Default for Stitcher {
 }
 
 fn is_photo(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-        Some("jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp")
-    )
+    nodal_stitch::decode::is_supported_path(p)
 }
 
 /// True when every image looks like a finished equirectangular panorama (2:1) rather than a
-/// photo to be stitched.
+/// photo to be stitched. Camera RAW files are always photos.
 pub fn all_panoramas(paths: &[PathBuf]) -> bool {
-    paths.iter().all(|p| match image::image_dimensions(p) {
-        Ok((w, h)) => (w as f32 / h as f32 - 2.0).abs() < 0.03,
+    paths.iter().all(|p| match nodal_stitch::decode::probe(p) {
+        Ok(info) => info.kind != nodal_stitch::decode::SourceKind::Raw && (info.width as f32 / info.height as f32 - 2.0).abs() < 0.03,
         Err(_) => true,
     })
 }
@@ -315,7 +314,7 @@ impl Stitcher {
             self.preview_stale = true;
             return;
         }
-        let Some(mut project) = self.preview_project() else { return };
+        let Some(mut project) = self.project.clone() else { return };
         self.preview_running = true;
         self.preview_stale = false;
         self.preview_generation += 1;
@@ -326,7 +325,8 @@ impl Stitcher {
         project.output.width = 0;
         std::thread::spawn(move || {
             let opts = RenderOptions { width: 1600, seam_width: 800, filter: Filter::Bilinear, bands: Some(4), ..Default::default() };
-            let msg = match nodal_stitch::render(&project, &images, &opts, &|_, _| {}) {
+            let pixels = nodal_stitch::MemoryPixels(images);
+            let msg = match nodal_stitch::render(&project, &pixels, &opts, &|_, _| {}) {
                 Ok(pano) => Msg::Preview { pano: Box::new(pano), generation },
                 Err(e) => Msg::Failed(format!("{e:#}")),
             };
@@ -350,7 +350,7 @@ impl Stitcher {
         let (tx, progress) = self.start("Creating panorama");
         project.output.width = self.output_width();
         let quality = self.quality;
-        let images: Vec<Arc<RgbImage>> = self.sources.iter().map(|s| s.image.clone()).collect();
+        let sources = self.sources.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
@@ -358,7 +358,7 @@ impl Stitcher {
                 *progress.lock().unwrap() = (f * 0.95, s.to_string());
                 ctx.request_repaint();
             };
-            let result = nodal_stitch::render(&project, &images, &RenderOptions::default(), &report).and_then(|pano| {
+            let result = nodal_stitch::render(&project, &sources, &RenderOptions::default(), &report).and_then(|pano| {
                 report(1.0, "Saving");
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
@@ -413,12 +413,8 @@ impl Stitcher {
                 let m = p.lenses[img.lens].model();
                 let r = img.rot();
                 let r = r.matrix();
-                let kind = match m.kind {
-                    LensKind::Rectilinear => 0.0,
-                    LensKind::Fisheye => 1.0,
-                    LensKind::FisheyeEquisolid => 2.0,
-                    LensKind::FisheyeStereographic => 3.0,
-                };
+                // The shader evaluates the continuous projection family directly.
+                let kind = m.k as f32;
                 let g = self.gains.get(i).copied().unwrap_or([1.0; 3]);
                 ComposePhoto {
                     // World → camera is the transpose of camera → world: its rows are the columns of `r`.
@@ -468,7 +464,10 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
                     let thumb = ctx.load_texture(format!("stitch-thumb-{name}"), color, TextureOptions::LINEAR);
                     let mut summary = src.exif.summary();
                     if summary.is_empty() {
-                        summary = format!("{} × {}", src.image.width(), src.image.height());
+                        summary = format!("{} × {}", src.width, src.height);
+                    }
+                    if !src.format.is_empty() && src.format != "memory" {
+                        summary = format!("{summary} · {}", src.format);
                     }
                     s.photos.push(Photo { name, summary, small: sm, thumb, layer });
                     s.sources.push(src);
@@ -484,7 +483,7 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
                         && p.images
                             .iter()
                             .zip(&s.sources)
-                            .all(|(img, src)| img.path == src.path && img.width == src.image.width() && img.height == src.image.height())
+                            .all(|(img, src)| img.path == src.path && img.width == src.width && img.height == src.height)
                 });
                 if let Some(project) = restored {
                     s.project = Some(project);
@@ -508,8 +507,9 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
             Msg::Preview { pano, generation } => {
                 s.preview_running = false;
                 if generation == s.preview_generation {
+                    let rgb8 = pano.rgb8();
                     let mut rgba = Vec::with_capacity(pano.width * pano.height * 4);
-                    for (p, a) in pano.rgb.as_chunks::<3>().0.iter().zip(&pano.alpha) {
+                    for (p, a) in rgb8.as_chunks::<3>().0.iter().zip(&pano.alpha) {
                         rgba.extend_from_slice(&[p[0], p[1], p[2], *a]);
                     }
                     let img = egui::ColorImage::from_rgba_unmultiplied([pano.width, pano.height], &rgba);
@@ -779,7 +779,7 @@ fn photo_panel(app: &mut NodalApp, ui: &mut Ui) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!app.stitcher.busy(), egui::Button::new("Add…").small()).clicked() {
                         if let Some(files) =
-                            rfd::FileDialog::new().add_filter("Photos", &["jpg", "jpeg", "png", "tif", "tiff", "webp"]).pick_files()
+                            rfd::FileDialog::new().add_filter("Photos and RAW", nodal_stitch::decode::EXTENSIONS).pick_files()
                         {
                             app.stitcher.add_photos(ui.ctx(), files);
                         }
@@ -991,10 +991,18 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
                     .on_hover_text("Crop a partial panorama to a clean rectangle")
                     .changed();
                 let mut fill = p.output.pole_fill == PoleFill::Auto;
-                if ui.checkbox(&mut fill, "Patch zenith and nadir gaps").changed() {
+                if ui
+                    .checkbox(&mut fill, "Fill voids")
+                    .on_hover_text("Patch the zenith, the nadir and any holes between photos. Off leaves them empty (transparent in TIFF, PNG and PSD).")
+                    .changed()
+                {
                     p.output.pole_fill = if fill { PoleFill::Auto } else { PoleFill::Off };
                     changed = true;
                 }
+                changed |= ui
+                    .checkbox(&mut p.output.vignetting_correction, "Correct vignetting")
+                    .on_hover_text("Brighten the corners using the lens falloff measured in the overlaps")
+                    .changed();
                 if fill {
                     ui.spacing_mut().slider_width = ui.available_width() - 150.0;
                     for (value, label, tip) in [
@@ -1053,8 +1061,13 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
                     ui.add(egui::DragValue::new(&mut s.custom_width).range(512..=65536).speed(16).suffix(" px wide"));
                 }
                 ui.horizontal(|ui| {
-                    for (f, label) in [(Format::Jpeg, "JPEG"), (Format::Tiff, "TIFF"), (Format::Png, "PNG")] {
-                        ui.selectable_value(&mut s.format, f, label);
+                    for (f, label, tip) in [
+                        (Format::Jpeg, "JPEG", "8-bit"),
+                        (Format::Tiff, "TIFF", "16-bit, keeps transparency"),
+                        (Format::Png, "PNG", "16-bit, keeps transparency"),
+                        (Format::Psd, "PSD", "16-bit Photoshop (PSB when very large)"),
+                    ] {
+                        ui.selectable_value(&mut s.format, f, label).on_hover_text(tip);
                     }
                 });
                 if s.format == Format::Jpeg {
@@ -1159,7 +1172,7 @@ fn centre(app: &mut NodalApp, ui: &mut Ui) {
                 ui.horizontal(|ui| {
                     icons::center_row(ui, &["Choose photos…"]);
                     if icons::pill(ui, Icon::Plus, "Choose photos…", true).clicked() {
-                        if let Some(files) = rfd::FileDialog::new().add_filter("Photos", &["jpg", "jpeg", "png", "tif", "tiff", "webp"]).pick_files() {
+                        if let Some(files) = rfd::FileDialog::new().add_filter("Photos and RAW", nodal_stitch::decode::EXTENSIONS).pick_files() {
                             s.add_photos(&ctx, files);
                         }
                     }
