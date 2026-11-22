@@ -109,6 +109,9 @@ pub enum Command {
         /// Do not level the horizon.
         #[arg(long)]
         no_level: bool,
+        /// Keep the uneven outline of a partial panorama instead of trimming to a clean rectangle.
+        #[arg(long)]
+        no_trim: bool,
         /// Also save the stitching project (orientations, lens, control points) to this file.
         #[arg(long)]
         project: Option<PathBuf>,
@@ -207,6 +210,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             no_local,
             no_lens_optimization,
             no_level,
+            no_trim,
             project,
             tour,
             title,
@@ -246,6 +250,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             proj.output.jpeg_quality = quality;
             proj.output.exposure_compensation = !no_exposure;
             proj.output.local_alignment = !no_local;
+            proj.output.trim_edges = !no_trim;
             proj.output.pole_fill = if no_fill { PoleFill::Off } else { PoleFill::Auto };
             proj.output.nadir_patch = nadir_patch;
             proj.output.zenith_patch = zenith_patch;

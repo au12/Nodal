@@ -14,11 +14,12 @@ work can resume from a cold start.
 3. [x] Local alignment: guided matching, sub-pixel refinement (`refine.rs`), warp fields (`local.rs`)
 4. [x] Pole patching (`fill.rs`): thin-plate base + coherent multi-scale PatchMatch in a pole view,
    full-res re-sampling. Known weak case: complex man-made structure overhead (station roofs)
-5. [ ] GPU: live stitch preview shader, GPU warp path
+5. [x] GPU: live stitch preview compositor (`nodal-render/src/compose.rs`). GPU warp/blend for the
+   final render is still open (CPU path is multi-threaded)
 6. [~] App: stitch workspace (`nodal-app/src/stitcher.rs`) with live preview, lens/alignment/output
    panels, Save panorama and Create tour. Still to do: project save/open, mask painting, circular
    fisheye crop detection, server-side stitching for the Docker image
-7. [ ] Docs, screenshots, changelog, version 0.2.0
+7. [x] Docs, screenshots, changelog, version 0.2.0 (tag `v0.2.0` must be pushed by the owner)
 
 ## Conventions
 - Camera frame: +X right, +Y up, +Z forward; image x right, y down. `rotation` maps camera → world.

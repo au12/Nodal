@@ -217,6 +217,9 @@ pub struct OutputSettings {
     pub zenith_patch: f32,
     #[serde(default = "default_quality")]
     pub jpeg_quality: u8,
+    /// Crop partial panoramas to the largest rectangle with no uncovered corners.
+    #[serde(default = "yes")]
+    pub trim_edges: bool,
 }
 
 fn default_quality() -> u8 {
@@ -236,6 +239,7 @@ impl Default for OutputSettings {
             nadir_patch: 0.0,
             zenith_patch: 0.0,
             jpeg_quality: 95,
+            trim_edges: true,
         }
     }
 }
