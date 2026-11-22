@@ -32,8 +32,15 @@ fn text(f: &exif::Field) -> Option<String> {
 
 /// Reads the EXIF fields the stitcher uses. Missing or malformed data simply leaves fields empty.
 pub fn read_exif(bytes: &[u8]) -> ExifInfo {
+    match exif::Reader::new().read_from_container(&mut Cursor::new(bytes)) {
+        Ok(ex) => exif_info(&ex),
+        Err(_) => ExifInfo::default(),
+    }
+}
+
+/// Extracts the fields the stitcher uses from parsed EXIF data.
+pub fn exif_info(ex: &exif::Exif) -> ExifInfo {
     let mut info = ExifInfo::default();
-    let Ok(ex) = exif::Reader::new().read_from_container(&mut Cursor::new(bytes)) else { return info };
     let get = |tag| ex.get_field(tag, exif::In::PRIMARY);
     info.make = get(exif::Tag::Make).and_then(text);
     info.model = get(exif::Tag::Model).and_then(text);
@@ -119,28 +126,122 @@ pub fn encode_jpeg(pano: &crate::render::Panorama, quality: u8) -> Result<Vec<u8
     let mut xmp = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
     xmp.extend_from_slice(gpano_xmp(pano).as_bytes());
     enc.add_app_segment(1, &xmp)?;
-    enc.encode(&pano.rgb, pano.width as u16, pano.height as u16, jpeg_encoder::ColorType::Rgb)?;
+    enc.add_icc_profile(&srgb_icc())?;
+    enc.encode(&pano.rgb8(), pano.width as u16, pano.height as u16, jpeg_encoder::ColorType::Rgb)?;
     Ok(out)
 }
 
-/// Saves a panorama; the format follows the file extension (jpg, png, tif). PNG and TIFF keep
-/// transparency where the panorama has gaps.
+/// ICC profile of the output colour space (sRGB).
+pub fn srgb_icc() -> Vec<u8> {
+    static ICC: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    ICC.get_or_init(|| moxcms::ColorProfile::new_srgb().encode().unwrap_or_default()).clone()
+}
+
+/// 16-bit samples, RGB or RGBA (alpha where the panorama has voids).
+fn samples16(pano: &crate::render::Panorama) -> (Vec<u16>, bool) {
+    use rayon::prelude::*;
+    if pano.has_gaps() {
+        let mut rgba = vec![0u16; pano.width * pano.height * 4];
+        rgba.par_chunks_mut(4).zip(pano.rgb.par_chunks(3)).zip(pano.alpha.par_iter()).for_each(|((o, p), a)| {
+            o[..3].copy_from_slice(p);
+            o[3] = *a as u16 * 257;
+        });
+        (rgba, true)
+    } else {
+        (pano.rgb.clone(), false)
+    }
+}
+
+/// TIFF tag payload of type UNDEFINED (the ICC profile tag requires it).
+struct Undefined<'a>(&'a [u8]);
+
+impl tiff::encoder::TiffValue for Undefined<'_> {
+    const BYTE_LEN: u8 = 1;
+    const FIELD_TYPE: tiff::tags::Type = tiff::tags::Type::UNDEFINED;
+    fn count(&self) -> usize {
+        self.0.len()
+    }
+    fn data(&self) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Borrowed(self.0)
+    }
+}
+
+fn write_tiff16<W: std::io::Write + std::io::Seek, K: tiff::encoder::TiffKind>(
+    mut enc: tiff::encoder::TiffEncoder<W, K>,
+    pano: &crate::render::Panorama,
+    data: &[u16],
+    alpha: bool,
+) -> Result<()> {
+    use tiff::encoder::colortype;
+    use tiff::tags::Tag;
+    let (w, h) = (pano.width as u32, pano.height as u32);
+    let xmp = gpano_xmp(pano).into_bytes();
+    let icc = srgb_icc();
+    macro_rules! write {
+        ($ct:ty) => {{
+            let mut img = enc.new_image::<$ct>(w, h)?;
+            img.encoder().write_tag(Tag::Unknown(700), &xmp[..])?;
+            if !icc.is_empty() {
+                img.encoder().write_tag(Tag::Unknown(34675), Undefined(&icc))?;
+            }
+            if alpha {
+                // Unassociated alpha.
+                img.encoder().write_tag(Tag::ExtraSamples, &[2u16][..])?;
+            }
+            img.rows_per_strip(64)?;
+            img.write_data(data)?;
+        }};
+    }
+    if alpha {
+        write!(colortype::RGBA16);
+    } else {
+        write!(colortype::RGB16);
+    }
+    Ok(())
+}
+
+fn save_tiff16(pano: &crate::render::Panorama, path: &Path) -> Result<()> {
+    use tiff::encoder::{Compression, DeflateLevel, TiffEncoder};
+    let (data, alpha) = samples16(pano);
+    let file = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(path)?);
+    if data.len() * 2 > 3_500_000_000 {
+        write_tiff16(TiffEncoder::new_big(file)?.with_compression(Compression::Deflate(DeflateLevel::Fast)), pano, &data, alpha)
+    } else {
+        write_tiff16(TiffEncoder::new(file)?.with_compression(Compression::Deflate(DeflateLevel::Fast)), pano, &data, alpha)
+    }
+}
+
+fn save_png16(pano: &crate::render::Panorama, path: &Path) -> Result<()> {
+    use image::ImageEncoder;
+    let (data, alpha) = samples16(pano);
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_be_bytes()).collect();
+    let file = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(path)?);
+    let mut enc = image::codecs::png::PngEncoder::new_with_quality(file, image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::Adaptive);
+    let _ = enc.set_icc_profile(srgb_icc());
+    // The image crate expects native-endian u16 bytes for 16-bit buffers.
+    let native: Vec<u8> = data.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    drop(bytes);
+    enc.write_image(&native, pano.width as u32, pano.height as u32, if alpha { image::ExtendedColorType::Rgba16 } else { image::ExtendedColorType::Rgb16 })?;
+    Ok(())
+}
+
+fn save_psd16(pano: &crate::render::Panorama, path: &Path) -> Result<()> {
+    let (data, alpha) = samples16(pano);
+    let ch = if alpha { 4 } else { 3 };
+    let f: Vec<f32> = data.iter().map(|&v| v as f32 / 65535.0).collect();
+    crate::psd::write(path, pano.width, pano.height, ch, 16, &f, Some(&srgb_icc()))
+}
+
+/// Saves a panorama; the format follows the file extension: `.jpg` (8-bit), `.tif` / `.png` /
+/// `.psd` / `.psb` (16-bit). Formats with alpha keep transparency where voids were left unfilled.
 pub fn save_panorama(pano: &crate::render::Panorama, path: &Path, quality: u8) -> Result<()> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     match ext.as_str() {
         "jpg" | "jpeg" => std::fs::write(path, encode_jpeg(pano, quality)?)?,
-        "png" | "tif" | "tiff" => {
-            if pano.has_gaps() {
-                let mut rgba = Vec::with_capacity(pano.width * pano.height * 4);
-                for (p, a) in pano.rgb.as_chunks::<3>().0.iter().zip(&pano.alpha) {
-                    rgba.extend_from_slice(&[p[0], p[1], p[2], *a]);
-                }
-                image::RgbaImage::from_raw(pano.width as u32, pano.height as u32, rgba).context("buffer size")?.save(path)?;
-            } else {
-                image::save_buffer(path, &pano.rgb, pano.width as u32, pano.height as u32, image::ColorType::Rgb8)?;
-            }
-        }
-        other => anyhow::bail!("unsupported output format \".{other}\" (use .jpg, .png or .tif)"),
+        "tif" | "tiff" => save_tiff16(pano, path)?,
+        "png" => save_png16(pano, path)?,
+        "psd" | "psb" => save_psd16(pano, path)?,
+        other => anyhow::bail!("unsupported output format \".{other}\" (use .jpg, .tif, .png or .psd)"),
     }
     Ok(())
 }

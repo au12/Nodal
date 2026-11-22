@@ -1,11 +1,11 @@
 //! Renders an aligned project into a panorama: remap, balance exposure, place seams, blend.
 
 use crate::blend::Blender;
-use crate::photometric::solve_gains;
+use crate::pixels::{self, LinearImage};
 use crate::project::Project;
 use crate::seam;
-use crate::warp::{image_roi, Canvas, Filter, ImageWarper, Layer, Roi};
-use crate::Progress;
+use crate::warp::{image_roi, Canvas, Filter, ImageWarper, Layer, Roi, SourcePixels};
+use crate::{PixelProvider, Progress};
 use anyhow::{ensure, Result};
 use image::RgbImage;
 use rayon::prelude::*;
@@ -35,6 +35,12 @@ impl Default for RenderOptions {
 pub struct RenderStats {
     /// Linear RGB gain applied to each project image (1.0 for unused images).
     pub gains: Vec<[f32; 3]>,
+    /// Images that ended up contributing pixels (others were fully covered by better ones).
+    pub used_images: Vec<usize>,
+    /// Images decoded at full resolution (the rest used working copies).
+    pub full_resolution_images: usize,
+    /// Interior holes and pole gaps filled, in percent of the image.
+    pub filled_percent: f32,
     pub bands: usize,
     pub seam_pairs: usize,
     /// (stage, seconds)
@@ -47,8 +53,8 @@ pub struct RenderStats {
 pub struct Panorama {
     pub width: usize,
     pub height: usize,
-    /// RGB8, `width × height`.
-    pub rgb: Vec<u8>,
+    /// 16-bit sRGB-encoded RGB, `width × height × 3`.
+    pub rgb: Vec<u16>,
     /// 255 where the panorama has image data, 0 in gaps.
     pub alpha: Vec<u8>,
     /// Size of the full equirectangular canvas this image was cut from.
@@ -78,8 +84,28 @@ impl Panorama {
         self.alpha.contains(&0)
     }
 
+    /// 8-bit sRGB copy of the pixels.
+    pub fn rgb8(&self) -> Vec<u8> {
+        self.rgb.par_iter().map(|&v| ((v as u32 * 255 + 32767) / 65535) as u8).collect()
+    }
+
     pub fn to_image(&self) -> RgbImage {
-        RgbImage::from_raw(self.width as u32, self.height as u32, self.rgb.clone()).expect("buffer size")
+        RgbImage::from_raw(self.width as u32, self.height as u32, self.rgb8()).expect("buffer size")
+    }
+
+    /// Builds a panorama from 8-bit pixels (tests and tools).
+    pub fn from_rgb8(width: usize, height: usize, rgb: &[u8], alpha: Vec<u8>) -> Panorama {
+        Panorama {
+            width,
+            height,
+            rgb: rgb.iter().map(|&v| v as u16 * 257).collect(),
+            alpha,
+            full_width: width,
+            full_height: height,
+            crop_x: 0,
+            crop_y: 0,
+            stats: RenderStats::default(),
+        }
     }
 }
 
@@ -164,65 +190,69 @@ fn padded_intervals(roi: &Roi, canvas_w: usize, pad: usize, align: usize) -> Vec
     merged
 }
 
-/// Renders the project. `images[i]` must be the pixels of `project.images[i]`.
-pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions, progress: Progress) -> Result<Panorama> {
-    ensure!(images.len() == project.images.len(), "one pixel buffer per project image");
+/// Render-time copy of the project with the output switches applied.
+fn prepared(project: &Project) -> Project {
+    let mut proj = project.clone();
+    if !proj.output.exposure_compensation {
+        proj.images.iter_mut().for_each(|i| i.gain = [1.0; 3]);
+    }
+    if !proj.output.vignetting_correction {
+        proj.lenses.iter_mut().for_each(|l| l.vignette = [0.0; 3]);
+    }
+    if !proj.output.local_alignment {
+        proj.images.iter_mut().for_each(|i| i.warp = None);
+    }
+    let ev = 2f32.powf(proj.develop.exposure);
+    if ev != 1.0 {
+        proj.images.iter_mut().for_each(|i| i.gain = [i.gain[0] * ev, i.gain[1] * ev, i.gain[2] * ev]);
+    }
+    proj
+}
+
+/// Converts a linear layer to perceptual values in 8-bit units, as the seam finder expects.
+fn perceptual_255(layer: &mut Layer) {
+    layer.rgb.par_chunks_mut(4096).for_each(|c| {
+        for v in c {
+            *v = pixels::to_perceptual_fast(*v) * 255.0;
+        }
+    });
+}
+
+/// Renders the project. Pixels come from `pixels` (working copies for reduced-size passes and
+/// previews, full-resolution decodes for the final output).
+pub fn render(project: &Project, pixels: &dyn PixelProvider, opts: &RenderOptions, progress: Progress) -> Result<Panorama> {
     let active: Vec<usize> = project.active().collect();
     ensure!(!active.is_empty(), "No aligned images to render. Align the images first.");
-    for &i in &active {
-        let (img, src) = (&project.images[i], &images[i]);
-        ensure!(src.width() == img.width && src.height() == img.height, "{} changed size since it was aligned", img.name);
-    }
     let mut stats = RenderStats { gains: vec![[1.0; 3]; project.images.len()], ..Default::default() };
     let mut clock = Instant::now();
     let mut lap = |stats: &mut RenderStats, name: &str| {
         stats.timings.push((name.to_string(), clock.elapsed().as_secs_f32()));
         clock = Instant::now();
     };
-
-    let mut proj = project.clone();
-    if proj.output.exposure_compensation {
-        proj.images.iter_mut().for_each(|i| i.gain = [1.0; 3]);
+    let proj = prepared(project);
+    for &i in &active {
+        stats.gains[i] = proj.images[i].gain;
     }
-    if !proj.output.local_alignment {
-        proj.images.iter_mut().for_each(|i| i.warp = None);
-    }
+    let working: Vec<Option<Arc<RgbImage>>> =
+        (0..proj.images.len()).map(|i| active.contains(&i).then(|| pixels.working(i))).collect();
 
-    // ---- Reduced-size pass: exposure and seams -------------------------------------------
+    // ---- Reduced-size pass: seams ------------------------------------------------------------
     progress(0.0, "Analysing overlaps");
     let lw = (opts.seam_width / 2 * 2).max(64);
     let low = Canvas::equirect(lw);
     let lh = low.h;
-    let mut low_layers: Vec<Layer> = active
-        .par_iter()
-        .map(|&i| {
-            let mut warper = ImageWarper::new(&proj, i, &images[i]);
-            // Stay clear of the photo's border so seams never sit on its very edge.
-            warper.inset = (2.0 * low.pixel_angle() / warper.model.pixel_angle()).max(2.0) as f32;
-            let roi = image_roi(&low, &warper.model, warper.rotation(), 2.0);
-            warper.render(&low, roi, Filter::Bilinear, true)
-        })
-        .collect();
+    let low_layer = |canvas: &Canvas, i: usize| {
+        let work = working[i].as_ref().expect("active image");
+        let mut warper = ImageWarper::new(&proj, i, SourcePixels::Srgb8(work));
+        // Stay clear of the photo's border so seams never sit on its very edge.
+        warper.inset = (2.0 * canvas.pixel_angle() / warper.model.pixel_angle()).max(2.0) as f32;
+        let roi = image_roi(canvas, &warper.model, warper.rotation(), 2.0);
+        let mut layer = warper.render(canvas, roi, Filter::Bilinear, true);
+        perceptual_255(&mut layer);
+        layer
+    };
+    let low_layers: Vec<Layer> = active.par_iter().map(|&i| low_layer(&low, i)).collect();
     lap(&mut stats, "preview warp");
-
-    if proj.output.exposure_compensation && active.len() > 1 {
-        let gains = solve_gains(&low_layers, lw, lh);
-        for (k, &i) in active.iter().enumerate() {
-            proj.images[i].gain = gains[k];
-            stats.gains[i] = gains[k];
-            let g = [gains[k][0].powf(1.0 / 2.2), gains[k][1].powf(1.0 / 2.2), gains[k][2].powf(1.0 / 2.2)];
-            low_layers[k].rgb.par_chunks_mut(3).for_each(|p| {
-                p[0] *= g[0];
-                p[1] *= g[1];
-                p[2] *= g[2];
-            });
-        }
-    } else {
-        for &i in &active {
-            stats.gains[i] = proj.images[i].gain;
-        }
-    }
-    lap(&mut stats, "exposure");
 
     progress(0.12, "Placing seams");
     let mut labels = seam::initial_labels(lw, lh, &low_layers);
@@ -230,15 +260,7 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
         // Coarse-to-fine: solve the seams freely on a quarter-size canvas, then polish them in a
         // narrow band at the working size.
         let coarse = Canvas::equirect((lw / 4 / 2 * 2).max(32));
-        let coarse_layers: Vec<Layer> = active
-            .par_iter()
-            .map(|&i| {
-                let mut warper = ImageWarper::new(&proj, i, &images[i]);
-                warper.inset = (2.0 * coarse.pixel_angle() / warper.model.pixel_angle()).max(2.0) as f32;
-                let roi = image_roi(&coarse, &warper.model, warper.rotation(), 2.0);
-                warper.render(&coarse, roi, Filter::Bilinear, true)
-            })
-            .collect();
+        let coarse_layers: Vec<Layer> = active.par_iter().map(|&i| low_layer(&coarse, i)).collect();
         let mut coarse_labels = seam::initial_labels(coarse.w, coarse.h, &coarse_layers);
         stats.seam_pairs = seam::refine_seams(&mut coarse_labels, coarse.w, coarse.h, &coarse_layers, true, 3, coarse.w / 8);
         seam::upsample_labels(&coarse_labels, coarse.w, coarse.h, &mut labels, lw, lh, &low_layers);
@@ -271,6 +293,7 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
         })
         .collect();
     drop(low_layers);
+    stats.used_images = used.iter().enumerate().filter(|(_, u)| u.is_some()).map(|(k, _)| active[k]).collect();
     lap(&mut stats, "seams");
 
     // ---- Full-resolution pass --------------------------------------------------------------
@@ -329,30 +352,71 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
     let profile = std::env::var_os("NODAL_PROFILE").is_some();
     let mut blender = Blender::new(bw, bh, bands);
     let a = align as i64;
-    for (k, &i) in active.iter().enumerate() {
-        progress(0.2 + 0.65 * k as f32 / active.len() as f32, "Blending");
-        // Only the part of the photo that the seams assign to it (plus blending context) is needed.
-        let Some(roi) = rois[k] else { continue };
-        let mut warper = ImageWarper::new(&proj, i, &images[i]);
-        // Vertical extent in blender coordinates, aligned.
-        let by0 = (roi.y0 - origin_y).max(0) / a * a;
-        let by1 = (roi.y0 + roi.h as i64 - origin_y + a - 1) / a * a;
-        let spans: Vec<(i64, i64)> = if periodic {
-            padded_intervals(&roi, width, pad, align)
+    // Which images need decoding at full resolution: only where the canvas is finer than the
+    // working copy.
+    let needs_full = |i: usize| {
+        let lens = proj.lens_of(i);
+        let work_w = working[i].as_ref().map(|w| w.width()).unwrap_or(1) as f64;
+        let work_angle = lens.model().pixel_angle() * proj.images[i].width as f64 / work_w;
+        canvas.pixel_angle() < work_angle * 1.3
+    };
+    let order: Vec<(usize, usize)> = active.iter().enumerate().filter(|(k, _)| rois[*k].is_some()).map(|(k, &i)| (k, i)).collect();
+    let load = |i: usize| -> Result<Option<Arc<LinearImage>>> {
+        if needs_full(i) {
+            pixels.full(i, &proj.develop).map(Some)
         } else {
-            vec![((roi.x0 - origin_x).max(0) / a * a, (roi.x0 + roi.w as i64 - origin_x + a - 1) / a * a)]
-        };
-        for (bx0, bx1) in spans {
-            let (lw_px, lh_px) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
-            let t0 = Instant::now();
-            let layer = warper.render(&canvas, Roi { x0: bx0 + origin_x, y0: by0 + origin_y, w: lw_px, h: lh_px }, opts.filter, false);
+            Ok(None)
+        }
+    };
+    // Decode the next photo on another thread while the current one is warped and blended.
+    let mut next = order.first().map(|&(_, i)| load(i)).transpose()?.flatten();
+    for (n, &(k, i)) in order.iter().enumerate() {
+        progress(0.2 + 0.65 * n as f32 / order.len() as f32, "Blending");
+        let roi = rois[k].expect("filtered");
+        let current = next.take();
+        let following = order.get(n + 1).map(|&(_, j)| j);
+        let work = working[i].clone().expect("active image");
+        let (layers_done, prefetched) = std::thread::scope(|scope| -> Result<(Vec<(i64, i64, usize, usize, Layer)>, Option<Arc<LinearImage>>)> {
+            let handle = following.map(|j| scope.spawn(move || load(j)));
+            let src = match &current {
+                Some(full) => SourcePixels::Linear(full),
+                None => SourcePixels::Srgb8(&work),
+            };
+            let mut warper = ImageWarper::new(&proj, i, src);
+            // Vertical extent in blender coordinates, aligned.
+            let by0 = (roi.y0 - origin_y).max(0) / a * a;
+            let by1 = (roi.y0 + roi.h as i64 - origin_y + a - 1) / a * a;
+            let spans: Vec<(i64, i64)> = if periodic {
+                padded_intervals(&roi, width, pad, align)
+            } else {
+                vec![((roi.x0 - origin_x).max(0) / a * a, (roi.x0 + roi.w as i64 - origin_x + a - 1) / a * a)]
+            };
+            let mut out = Vec::new();
+            for (bx0, bx1) in spans {
+                let (lw_px, lh_px) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
+                let mut layer = warper.render(&canvas, Roi { x0: bx0 + origin_x, y0: by0 + origin_y, w: lw_px, h: lh_px }, opts.filter, false);
+                layer.rgb.par_chunks_mut(4096).for_each(|c| c.iter_mut().for_each(|v| *v = pixels::to_perceptual_fast(*v)));
+                out.push((bx0, by0, lw_px, lh_px, layer));
+            }
+            let pre = match handle {
+                Some(hd) => hd.join().map_err(|_| anyhow::anyhow!("decoder thread panicked"))??,
+                None => None,
+            };
+            Ok((out, pre))
+        })?;
+        if current.is_some() {
+            stats.full_resolution_images += 1;
+        }
+        drop(current);
+        next = prefetched;
+        for (bx0, by0, lw_px, lh_px, layer) in layers_done {
             let t1 = Instant::now();
             let mask = layer_mask(&layer, &canvas, &labels, lw, lh, k as u16);
             let alpha: Vec<f32> = layer.alpha.par_iter().map(|&a| if a > 0 { 1.0 } else { 0.0 }).collect();
             let t2 = Instant::now();
             blender.feed(bx0, by0, lw_px, lh_px, layer.rgb, alpha, mask);
             if profile {
-                eprintln!("layer {k}: {lw_px}x{lh_px} warp {:.2?} mask {:.2?} blend {:.2?}", t1 - t0, t2 - t1, t2.elapsed());
+                eprintln!("layer {k}: {lw_px}x{lh_px} mask {:.2?} blend {:.2?}", t2 - t1, t2.elapsed());
             }
         }
     }
@@ -362,7 +426,7 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
     let (out, cov) = blender.finish();
     // The part of the blend canvas that becomes the image.
     let (ow, oh, skip_x) = if periodic { (width, h, pad) } else { (bw, bh, 0) };
-    let mut rgb = vec![0u8; ow * oh * 3];
+    let mut rgb = vec![0u16; ow * oh * 3];
     let mut alpha = vec![0u8; ow * oh];
     rgb.par_chunks_mut(ow * 3).zip(alpha.par_chunks_mut(ow)).enumerate().for_each(|(y, (row, arow))| {
         let src = &out[(y * bw + skip_x) * 3..(y * bw + skip_x + ow) * 3];
@@ -370,9 +434,9 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
         for x in 0..ow {
             if c[x] > 1e-3 {
                 arow[x] = 255;
-                row[x * 3] = (src[x * 3] + 0.5).clamp(0.0, 255.0) as u8;
-                row[x * 3 + 1] = (src[x * 3 + 1] + 0.5).clamp(0.0, 255.0) as u8;
-                row[x * 3 + 2] = (src[x * 3 + 2] + 0.5).clamp(0.0, 255.0) as u8;
+                for k in 0..3 {
+                    row[x * 3 + k] = pixels::encode_srgb16(pixels::from_perceptual(src[x * 3 + k]));
+                }
             }
         }
     });
@@ -395,12 +459,13 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
     if proj.output.trim_edges && !pano.is_full_sphere() {
         trim_to_inner_rectangle(&mut pano);
     }
-    if proj.output.pole_fill == crate::project::PoleFill::Auto && pano.is_full_sphere() {
+    if proj.output.pole_fill == crate::project::PoleFill::Auto {
         let t = Instant::now();
         let fill =
             crate::fill::FillOptions { zenith_patch: proj.output.zenith_patch, nadir_patch: proj.output.nadir_patch, ..Default::default() };
-        crate::fill::fill_poles(&mut pano, &fill, &|f, s| progress(0.9 + 0.1 * f, s));
-        pano.stats.timings.push(("pole patch".to_string(), t.elapsed().as_secs_f32()));
+        let report = crate::fill::fill_voids(&mut pano, &fill, &|f, s| progress(0.9 + 0.1 * f, s));
+        pano.stats.filled_percent = report.filled_percent;
+        pano.stats.timings.push(("void fill".to_string(), t.elapsed().as_secs_f32()));
     }
     progress(1.0, "Done");
     Ok(pano)
@@ -434,7 +499,7 @@ pub fn crop_to_coverage(pano: &mut Panorama) {
     let y0 = row.iter().position(|c| *c).unwrap();
     let y1 = row.iter().rposition(|c| *c).unwrap() + 1;
     let (nw, nh) = (x1 - x0, y1 - y0);
-    let mut rgb = vec![0u8; nw * nh * 3];
+    let mut rgb = vec![0u16; nw * nh * 3];
     let mut alpha = vec![0u8; nw * nh];
     for y in 0..nh {
         let s = (y + y0) * w + x0;
@@ -489,7 +554,7 @@ pub fn trim_to_inner_rectangle(pano: &mut Panorama) {
         return;
     }
     let (nw, nh) = (x1 - x0, y1 - y0);
-    let mut rgb = vec![0u8; nw * nh * 3];
+    let mut rgb = vec![0u16; nw * nh * 3];
     for y in 0..nh {
         let s = (y + y0) * w + x0;
         rgb[y * nw * 3..(y + 1) * nw * 3].copy_from_slice(&pano.rgb[s * 3..(s + nw) * 3]);
