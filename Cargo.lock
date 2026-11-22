@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "nodal-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "nodal-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.30.10",
  "serde",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "nodal-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "glam 0.30.10",
@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "nodal-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2185,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "nodal-stitch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "image",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "nodal-tiler"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam 0.30.10",

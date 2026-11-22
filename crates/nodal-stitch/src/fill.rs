@@ -177,6 +177,8 @@ struct Level {
     rho: Vec<f32>,
     /// Local detail energy (same units as patch distances).
     energy: Vec<f32>,
+    /// Detail energy considered normal for the surroundings (a multiple of their median).
+    energy_floor: f32,
     /// How deep inside the gap each pixel is: 0 at the rim, 1 at the centre.
     depth: Vec<f32>,
     /// How many target patches currently borrow from each source patch.
@@ -206,7 +208,7 @@ fn dilate(mask: &[bool], w: usize, h: usize, r: isize) -> Vec<bool> {
     out
 }
 
-fn finish_level(w: usize, h: usize, image: &[f32], base: Vec<f32>, known: Vec<bool>, hole: Vec<bool>) -> Level {
+fn finish_level(w: usize, h: usize, image: &[f32], base: Vec<f32>, known: Vec<bool>, hole: Vec<bool>, top: bool) -> Level {
     let mut detail = vec![0.0f32; w * h * 3];
     detail.par_chunks_mut(3).enumerate().for_each(|(i, d)| {
         if known[i] {
@@ -298,7 +300,17 @@ fn finish_level(w: usize, h: usize, image: &[f32], base: Vec<f32>, known: Vec<bo
     }
     let max_d = d.max(1) as f32;
     let depth: Vec<f32> = dist.iter().map(|&v| if v == u32::MAX { 0.0 } else { v as f32 / max_d }).collect();
-    Level { w, h, detail, base, known, hole, target, source, sources, rho, energy, depth, usage, reuse_cost: 0.0 }
+    let mut src_energy: Vec<f32> = sources.iter().map(|&i| energy[i as usize]).collect();
+    // Overhead, open sky or a plain ceiling is the safe assumption, so any busy material counts.
+    // Underfoot, texture is normal: only material much busier than the typical ground counts.
+    let energy_floor = if top || src_energy.is_empty() {
+        0.0
+    } else {
+        let k = src_energy.len() / 2;
+        src_energy.select_nth_unstable_by(k, |a, b| a.total_cmp(b));
+        4.0 * src_energy[k]
+    };
+    Level { w, h, detail, base, known, hole, target, source, sources, rho, energy, energy_floor, depth, usage, reuse_cost: 0.0 }
 }
 
 /// Patch distance between target patch `p` and source patch `q`, abandoning once above `limit`.
@@ -371,13 +383,14 @@ fn coherence_factor(l: &Level, nnf: &[(i32, i32)], p: (isize, isize), q: (i32, i
     1.0 - COHERENCE * same as f32 / 4.0
 }
 
-/// Prior cost of placing source patch `q` at target `p`: deep inside the gap, plain material is
-/// preferred over busy material. Structure may continue a little way in from the rim, but the
-/// unknown middle is filled with the calmest material around (sky rather than rooftops). Where
-/// everything around is equally textured the term is the same for every candidate and has no effect.
+/// Prior cost of placing source patch `q` at target `p`: deep inside the gap, material that is
+/// much busier than its surroundings is discouraged. Structure may continue a little way in from
+/// the rim, but the unknown middle is filled with what dominates around it (sky rather than the
+/// rooftops poking into it). Texture that is normal for the surroundings (tile joints, grass) is
+/// below the threshold and unaffected.
 #[inline]
 fn structure_prior(l: &Level, p: usize, q: usize) -> f32 {
-    l.energy[q] * (l.depth[p] * 4.0).min(1.0)
+    (l.energy[q] - l.energy_floor).max(0.0) * (l.depth[p] * 4.0).min(1.0)
 }
 
 /// One PatchMatch sweep (propagation + random search), parallel over horizontal strips.
@@ -842,7 +855,7 @@ fn synthesise(pano: &Panorama, top: bool, gap_deg: f32, opts: &FillOptions) -> O
         for li in 0..=n_levels {
             let known_b: Vec<bool> = kn.data.iter().map(|v| *v > 0.999).collect();
             let hole_b: Vec<bool> = ho.data.iter().map(|v| *v > 0.3).collect();
-            levels.push(finish_level(img.w, img.h, &img.data, bas.data.clone(), known_b, hole_b));
+            levels.push(finish_level(img.w, img.h, &img.data, bas.data.clone(), known_b, hole_b, top));
             if li == n_levels {
                 break;
             }

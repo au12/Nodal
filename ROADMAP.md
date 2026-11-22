@@ -27,7 +27,34 @@ plan will change as real use shows what matters. Ideas and requests are welcome 
 - [x] **CI.** fmt, clippy, tests including the GPU-vs-CPU PSNR comparison, an end-to-end Docker
       smoke test and the macOS app build
 
-## ⏳ 0.2: Distribution and polish
+## ✅ 0.2: Stitching (shipped)
+
+- [x] **Stitching engine.** Rectilinear and fisheye lenses, any shooting pattern, automatic lens
+      detection and calibration (field of view, distortion a/b/c, shift)
+- [x] **Sub-pixel alignment** with full-resolution control point refinement and bundle adjustment
+- [x] **Local alignment** for parallax and lens quirks
+- [x] **Exposure and white-balance compensation,** minimum-cut seams and multi-band blending
+- [x] **Pole patching** for zenith and nadir gaps, plus a tripod patch
+- [x] **Stitching workspace** in the native app with a GPU live preview
+- [x] **`nodal stitch`** command and photos-to-tour in one step
+- [x] **GPano metadata** written by the stitcher and read by the tiler
+
+## ⏳ 0.3: Stitching, deeper
+
+- [ ] **Mask painting.** Mark areas to keep or exclude (people, the tripod, your own shadow)
+- [ ] **Control point editor.** See, add and remove points on the photos
+- [ ] **Project files.** Save and reopen a stitching project from the app (the CLI already writes them)
+- [ ] **Exposure brackets and HDR.** Merge bracketed shots and blend with exposure fusion
+- [ ] **RAW input** and a 16-bit pipeline with 16-bit TIFF output
+- [ ] **Circular fisheye** crop detection, and per-photo lens parameters for mixed sets
+- [ ] **Viewpoint correction** for handheld nadir shots
+- [ ] **More output projections:** cylindrical, rectilinear and little-planet stills from the stitcher
+- [ ] **Faster rendering.** GPU blending, tight full-resolution regions per photo, and streaming
+      photos from disk so very large sets fit in memory
+- [ ] **Stitching in the web and Docker UI:** upload a photo set and stitch it on the server
+- [ ] **Better patches for structured ceilings** and other hard cases overhead
+
+## ⏳ 0.4: Distribution and polish
 
 - [ ] **Notarized Mac builds.** The workflow is ready and needs Developer ID secrets. This removes the
       first-launch Gatekeeper step
@@ -38,11 +65,10 @@ plan will change as real use shows what matters. Ideas and requests are welcome 
 - [ ] **Linux packages:** AppImage and Flatpak
 - [ ] **Unraid Community Applications** listing
 - [ ] **Faster image builds** with cargo-chef dependency caching
-- [ ] **Read GPano XMP metadata** (Photo Sphere) to auto-detect partial panoramas and the initial view
 - [ ] **Gyroscope look-around** on phones and tablets, with a permission prompt on iOS
 - [ ] **Accessibility:** keyboard focus for hotspots, screen-reader labels and reduced-motion transitions
 
-## ⏳ 0.3: Sharing and embedding
+## ⏳ 0.5: Sharing and embedding
 
 - [ ] **Embed API.** An `<iframe>` snippet generator plus a `postMessage` API (set the view, go to a
       scene, receive events)
@@ -54,7 +80,7 @@ plan will change as real use shows what matters. Ideas and requests are welcome 
 - [ ] **Immich import.** Pull equirectangular photos from an Immich album into a tour
 - [ ] **Bulk operations.** Tile a whole folder, re-tile at a new quality, and duplicate or merge tours
 
-## ⏳ 0.4: Richer media
+## ⏳ 0.6: Richer media
 
 - [ ] **GPU-compressed tiles** (KTX2 + Basis Universal → BC7/ASTC/ETC2). These use less VRAM, upload
       faster and allow larger atlases on phones
@@ -83,10 +109,9 @@ plan will change as real use shows what matters. Ideas and requests are welcome 
   aren't wired up yet.
 - The server has **one shared token**, with no per-user accounts yet.
 - On **Windows** the `.exe` is also the command-line tool, so a console window opens alongside the app.
-- Panoramas must be **stitched equirectangular** images (full or partial).
+- **Stitching** runs in the native app and CLI only, on 8-bit photos, with the whole set in memory.
+- **Pole patches** are synthesised: complex structure directly overhead can look invented.
 
 ## Not planned
 
-- **Stitching** raw photos into panoramas. Hugin, PTGui and camera apps already do this well, and
-  Nodal starts from their output.
 - **Reading proprietary viewers' project files.** Nodal is a clean-room project.

@@ -392,6 +392,9 @@ pub fn render(project: &Project, images: &[Arc<RgbImage>], opts: &RenderOptions,
         stats,
     };
     crop_to_coverage(&mut pano);
+    if proj.output.trim_edges && !pano.is_full_sphere() {
+        trim_to_inner_rectangle(&mut pano);
+    }
     if proj.output.pole_fill == crate::project::PoleFill::Auto && pano.is_full_sphere() {
         let t = Instant::now();
         let fill =
@@ -440,6 +443,59 @@ pub fn crop_to_coverage(pano: &mut Panorama) {
     }
     pano.rgb = rgb;
     pano.alpha = alpha;
+    pano.width = nw;
+    pano.height = nh;
+    pano.crop_x += x0;
+    pano.crop_y += y0;
+}
+
+/// Crops a partial panorama to the largest axis-aligned rectangle that is completely covered,
+/// removing the ragged, empty corners left by the photos' outlines. Does nothing if that would
+/// throw away most of the image.
+pub fn trim_to_inner_rectangle(pano: &mut Panorama) {
+    let (w, h) = (pano.width, pano.height);
+    if w == 0 || h == 0 || !pano.has_gaps() {
+        return;
+    }
+    // Largest rectangle of covered pixels: histogram of column heights, row by row.
+    let mut heights = vec![0u32; w];
+    let mut best = (0u64, 0usize, 0usize, 0usize, 0usize); // area, x0, y0, x1, y1
+    let mut stack: Vec<usize> = Vec::with_capacity(w);
+    for y in 0..h {
+        let row = &pano.alpha[y * w..(y + 1) * w];
+        for x in 0..w {
+            heights[x] = if row[x] != 0 { heights[x] + 1 } else { 0 };
+        }
+        stack.clear();
+        for x in 0..=w {
+            let cur = if x < w { heights[x] } else { 0 };
+            while let Some(&top) = stack.last() {
+                if heights[top] < cur {
+                    break;
+                }
+                stack.pop();
+                let height = heights[top] as usize;
+                let left = stack.last().map_or(0, |&l| l + 1);
+                let area = (height * (x - left)) as u64;
+                if area > best.0 {
+                    best = (area, left, y + 1 - height, x, y + 1);
+                }
+            }
+            stack.push(x);
+        }
+    }
+    let (area, x0, y0, x1, y1) = best;
+    if (area as f64) < 0.5 * (w * h) as f64 {
+        return;
+    }
+    let (nw, nh) = (x1 - x0, y1 - y0);
+    let mut rgb = vec![0u8; nw * nh * 3];
+    for y in 0..nh {
+        let s = (y + y0) * w + x0;
+        rgb[y * nw * 3..(y + 1) * nw * 3].copy_from_slice(&pano.rgb[s * 3..(s + nw) * 3]);
+    }
+    pano.rgb = rgb;
+    pano.alpha = vec![255u8; nw * nh];
     pano.width = nw;
     pano.height = nh;
     pano.crop_x += x0;

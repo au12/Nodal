@@ -3,7 +3,7 @@
 <h1 align="center">Nodal</h1>
 
 <p align="center">
-  <b>Fast, GPU-accelerated 360° panoramas and virtual tours.</b><br>
+  <b>Stitch photos into flawless 360° panoramas, then turn them into virtual tours.</b><br>
   A native app for macOS, Linux and Windows, a WebGPU viewer and a self-hosted Docker server, all in Rust.
 </p>
 
@@ -17,6 +17,7 @@
 
 <p align="center">
   <a href="#install">Install</a> ·
+  <a href="#stitching">Stitching</a> ·
   <a href="#features">Features</a> ·
   <a href="#screenshots">Screenshots</a> ·
   <a href="#how-it-works">How it works</a> ·
@@ -25,12 +26,17 @@
   <a href="ROADMAP.md">Roadmap</a>
 </p>
 
-![Nodal web viewer](docs/screenshots/desktop-viewer.jpg)
+![Nodal stitching workspace](docs/screenshots/native-stitch.jpg)
 
-Nodal turns equirectangular panoramas into multi-resolution tile pyramids and streams them into a
-single-pass GPU renderer. Use the same codebase as a **native desktop app** (Metal, Vulkan, DX12),
-in the **browser** (WebGPU with a WebGL 2 fallback) or as a **Docker server** with a tour library,
-browser uploads and a built-in editor.
+Nodal covers the whole panorama workflow in one app:
+
+1. **Stitch.** Drop in overlapping photos from any lens, in any order. Nodal finds the overlaps,
+   calibrates the lens, aligns everything to a fraction of a pixel, balances exposure, hides the
+   seams and patches the gaps straight up and straight down.
+2. **View.** Panoramas are cut into multi-resolution tiles and streamed into a single-pass GPU
+   renderer (Metal, Vulkan, DX12, WebGPU with a WebGL 2 fallback).
+3. **Publish.** Link panoramas into virtual tours with hotspots in the built-in editor, and share
+   them from the **Docker server** or any static web host.
 
 ## Install
 
@@ -98,17 +104,19 @@ Tagged releases include `nodal` archives for Linux (x86_64, arm64) and Windows (
 ## Using it
 
 ```sh
-nodal                          # start screen: drop panoramas or open a tour folder
-nodal ~/Pictures/pano.jpg      # tiles into a new tour and opens it
+nodal                          # start screen: drop photos, panoramas or a tour folder
+nodal IMG_01.jpg IMG_02.jpg …  # overlapping photos open in the stitching workspace
+nodal ~/Pictures/pano.jpg      # a finished 2:1 panorama is tiled into a new tour and opened
 nodal path/to/tour             # opens an existing tour
 ```
 
-Press **E** to edit, **P** to cycle projections and **?** for every shortcut. The same binary is a
-command-line tool:
+In the viewer, press **E** to edit, **P** to cycle projections and **?** for every shortcut. The same
+binary is a command-line tool:
 
 ```sh
-nodal tile -o my-tour --title "My Tour" a.jpg b.jpg c.jpg   # create or extend a tour
-nodal tile -o my-tour --hfov 360 --vfov 120 strip.jpg       # partial panorama
+nodal stitch IMG_*.jpg -o pano.jpg                          # stitch photos into a panorama
+nodal stitch IMG_*.jpg -o pano.jpg --nadir-patch 25 --tour my-tour   # paint out the tripod, build a tour
+nodal tile -o my-tour --title "My Tour" a.jpg b.jpg c.jpg   # create or extend a tour from panoramas
 nodal render my-tour --projection little-planet --size 3840x2160 -o planet.jpg   # headless GPU still
 nodal info my-tour                                          # summary + broken links
 ```
@@ -116,6 +124,46 @@ nodal info my-tour                                          # summary + broken l
 `--projection` accepts `rectilinear`, `fisheye`, `stereographic`, `little-planet`, `pannini` and `equirect`.
 A tour is a folder with `tour.json` and tiles, so any static web server can host it next to the web
 viewer (`?tour=path/to/tour.json`).
+
+## Stitching
+
+Stitching is fully automatic, and every step can be inspected or overridden in the workspace.
+
+- **Any lens, any order.** Rectilinear and fisheye lenses, single-row, multi-row and full-sphere
+  sets. The lens type and field of view come from EXIF when available and are otherwise estimated
+  from the photos themselves.
+- **Sub-pixel alignment.** Scale- and rotation-invariant features are matched between every
+  overlapping pair, verified geometrically and then polished at full resolution by correlation.
+  A bundle adjustment solves all orientations together with the field of view, radial distortion
+  (a, b, c) and lens shift, discarding outliers as it goes.
+- **Local alignment.** Where real photos still disagree (slight parallax, lens quirks), each photo
+  gets a smooth correction field so matched points land on the same pixel.
+- **Invisible seams.** Exposure and white balance are equalised, seams are routed by minimum cuts
+  through areas where the photos agree, and multi-band blending mixes each frequency band over a
+  distance that suits it.
+- **Pole patching.** Gaps at the zenith and nadir are filled automatically: lighting is continued
+  smoothly across the gap and texture is synthesised from the surrounding image. `--nadir-patch`
+  also paints out a tripod.
+- **Level and centred.** The horizon is levelled automatically; drag the preview to re-centre it.
+  While you drag, the preview is re-projected live on the GPU.
+- **Output.** JPEG, PNG or TIFF at the photos' native resolution or any size, with Photo Sphere
+  (GPano) metadata. Partial panoramas are trimmed to a clean rectangle. One click builds a tour.
+
+![Nadir gap before and after patching](docs/screenshots/pole-patch.jpg)
+
+*Looking straight down in a 23-photo panorama: the gap the photos left under the camera (left) and
+the automatic patch (right).*
+
+**Accuracy.** The test suite renders synthetic photo sets from a known panorama through a known
+lens, stitches them and compares against the truth. For a six-shot fisheye sphere the recovered
+field of view is within 1° of the true 165°, orientations within 0.15°, and control points agree to
+about 0.2 px.
+
+**Limits to know about.** Stitching currently runs in the native app and CLI, not in the web or
+Docker UI. Photos are processed as 8-bit RGB (RAW files and exposure brackets are on the
+[roadmap](ROADMAP.md)). Pole patches are synthesised, not photographed: plain sky, pavement, grass
+and floors come out convincingly, while complex structure directly overhead (a station roof, a
+street canyon) can look invented.
 
 ## Features
 
@@ -139,6 +187,11 @@ viewer (`?tour=path/to/tour.json`).
 - A built-in editor in the native app and the browser: click to place hotspots, click corners to draw
   areas, drag to move, undo and redo, set start views and north, and reorder or add scenes.
 
+**Stitcher**
+- A complete stitching engine (see [Stitching](#stitching)): feature matching, lens calibration,
+  bundle adjustment, local alignment, minimum-cut seams, multi-band blending and pole patching.
+- Multi-threaded throughout, with a GPU live preview while you re-centre or level the panorama.
+
 **Tiler and server**
 - The tiler renders each cube face once at full resolution, then box-filters down the pyramid in
   linear light, using bicubic sampling near 1:1 and pole-aware filtering on all cores. An 8K panorama
@@ -148,6 +201,10 @@ viewer (`?tour=path/to/tour.json`).
   served precompressed.
 
 ## Screenshots
+
+**Stitching workspace (native)**
+
+![Stitching workspace](docs/screenshots/native-stitch.jpg)
 
 **Desktop (web)**
 
@@ -176,6 +233,8 @@ The demo tour uses six CC0 panoramas from [Poly Haven](https://polyhaven.com); r
 
 ```mermaid
 flowchart LR
+    photos["Overlapping<br/>photos"] --> stitch["nodal-stitch<br/>align · blend · patch"]
+    stitch --> pano
     pano["Equirectangular<br/>panoramas"] --> tiler["nodal-tiler<br/>cube faces + mip pyramid"]
     tiler --> tour[("Tour folder<br/>tour.json + tiles")]
     tour --> server["nodal-server<br/>library · uploads · jobs"]
@@ -192,8 +251,9 @@ flowchart LR
 | Crate | What it does |
 |---|---|
 | `nodal-core` | Projections (forward and inverse), cube mapping, the tile pyramid and the tour model. Pure math with unit tests. |
+| `nodal-stitch` | The stitching engine: EXIF and lens models, features and matching, bundle adjustment, local alignment, warping, seams, blending and pole patching. |
 | `nodal-tiler` | Converts equirect images into bordered multi-resolution cube tiles, thumbnails and `tour.json`. |
-| `nodal-render` | The wgpu renderer: per-pixel projection shader, virtual-texture atlas and page table, streaming, transitions and headless rendering. |
+| `nodal-render` | The wgpu renderer: per-pixel projection shader, virtual-texture atlas and page table, streaming, transitions, headless rendering and the live stitch-preview compositor. |
 | `nodal-app` | The `nodal` binary (app and CLI) and the WASM web viewer, built on eframe/egui. |
 | `nodal-server` | The Docker server: REST API, background tiling queue and static hosting with precompression. |
 
@@ -335,9 +395,8 @@ Gatekeeper step.
 
 ## Roadmap
 
-Coming up next are a notarized Mac app with Finder *Open With* support, a Windows installer,
-AppImage/Flatpak, gyroscope look-around on phones, an embed API, GPU-compressed tiles and video
-panoramas. See **[ROADMAP.md](ROADMAP.md)** for the full plan and known limitations.
+Coming up next are mask painting and a control point editor, exposure-bracket (HDR) and RAW input,
+GPU blending, stitching in the Docker web UI, a notarized Mac app and a Windows installer. See **[ROADMAP.md](ROADMAP.md)** for the full plan and known limitations.
 
 ## Numbers
 
@@ -346,6 +405,9 @@ much faster.
 
 | | |
 |---|---|
+| Align 8 fisheye photos (features, matching, calibration, sub-pixel refinement) | 4.7 s |
+| Align 23 rectilinear photos in three rows (8,800 control points) | 15 s |
+| Render that set to 6000×3000 with seams, blending and both poles patched | 14 s |
 | Tile an 8192×4096 panorama (510 tiles, 4 levels) | 3.1 s |
 | Headless 3840×2160 little-planet render (CPU Vulkan, lavapipe) | 1.2 s |
 | GPU vs CPU reference, all projections | 31–38 dB PSNR |
@@ -355,12 +417,14 @@ much faster.
 ## Clean room
 
 Nodal is an original, independent implementation. It contains no code from any commercial panorama
-viewer and was not derived from one. It uses only public techniques: cube maps, mip pyramids, virtual
-texturing and standard map projections.
+viewer or stitcher and was not derived from one. It uses only published techniques: SIFT features,
+bundle adjustment, graph-cut seams, Laplacian-pyramid blending, PatchMatch synthesis, cube maps, mip
+pyramids, virtual texturing and standard map projections.
 
 ## Credits
 
-Demo panoramas come from [Poly Haven](https://polyhaven.com) (CC0). The UI font is
+Demo panoramas, and the synthetic photo sets in the stitching screenshots, come from
+[Poly Haven](https://polyhaven.com) (CC0). The UI font is
 [Inter](https://rsms.me/inter/) (SIL Open Font License, `crates/nodal-app/assets/Inter-OFL.txt`).
 Nodal is built on [wgpu](https://wgpu.rs), [egui](https://egui.rs) and [axum](https://github.com/tokio-rs/axum).
 

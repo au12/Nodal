@@ -923,6 +923,10 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
                     .checkbox(&mut p.output.local_alignment, "Local alignment")
                     .on_hover_text("Small per-photo corrections so matched points coincide exactly")
                     .changed();
+                changed |= ui
+                    .checkbox(&mut p.output.trim_edges, "Trim uneven edges")
+                    .on_hover_text("Crop a partial panorama to a clean rectangle")
+                    .changed();
                 let mut fill = p.output.pole_fill == PoleFill::Auto;
                 if ui.checkbox(&mut fill, "Patch zenith and nadir gaps").changed() {
                     p.output.pole_fill = if fill { PoleFill::Auto } else { PoleFill::Off };

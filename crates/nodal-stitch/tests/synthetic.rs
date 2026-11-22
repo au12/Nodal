@@ -122,8 +122,10 @@ fn rectilinear_partial_panorama_matches_ground_truth() {
     assert!(err < 1.0, "orientation error {err:.3}°");
     let pano = render(&scene.project, &scene.shots, &RenderOptions::default(), &|_, _| {}).unwrap();
     assert!(!pano.is_full_sphere());
+    // Partial panoramas are trimmed to a clean rectangle by default.
+    assert!(!pano.has_gaps(), "trimmed panorama should have no uncovered corners");
     let (hfov, vfov, _) = pano.coverage_degrees();
-    assert!(hfov > 140.0 && hfov < 175.0 && vfov > 55.0 && vfov < 90.0, "coverage {hfov:.1}° × {vfov:.1}°");
+    assert!(hfov > 120.0 && hfov < 175.0 && vfov > 30.0 && vfov < 90.0, "coverage {hfov:.1}° × {vfov:.1}°");
     let (db, _) = psnr(&scene, &pano);
     assert!(db > 24.0, "PSNR {db:.1} dB");
 }
