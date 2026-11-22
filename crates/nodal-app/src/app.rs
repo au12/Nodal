@@ -158,6 +158,8 @@ impl NodalApp {
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             let engine = PanoEngine::new(&rs.device, rs.target_format);
             rs.renderer.write().callback_resources.insert(engine);
+            #[cfg(not(target_arch = "wasm32"))]
+            rs.renderer.write().callback_resources.insert(nodal_render::Composer::new(&rs.device, rs.target_format));
             let info = rs.adapter.get_info();
             gpu_info = format!("{} · {:?}", info.name, info.backend);
             log::info!("GPU: {gpu_info}, target {:?}", rs.target_format);
@@ -800,7 +802,7 @@ impl eframe::App for NodalApp {
             Screen::Library => library::show(self, ui),
             Screen::Viewer => self.viewer(ui, frame),
             #[cfg(not(target_arch = "wasm32"))]
-            Screen::Stitch => crate::stitcher::show(self, ui),
+            Screen::Stitch => crate::stitcher::show(self, ui, frame),
             #[cfg(target_arch = "wasm32")]
             Screen::Stitch => library::show(self, ui),
         }
