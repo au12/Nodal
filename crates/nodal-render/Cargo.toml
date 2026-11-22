@@ -4,6 +4,8 @@ description = "wgpu panorama renderer with virtual-texture tile streaming"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 nodal-core = { path = "../nodal-core" }

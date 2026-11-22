@@ -39,7 +39,7 @@ pub fn match_descriptors(fa: &FeatureSet, fb: &FeatureSet, ratio: f32) -> Vec<Ra
         .enumerate()
         .filter_map(|(ia, da)| {
             let (mut best, mut second, mut best_i) = (u32::MAX, u32::MAX, 0u32);
-            for (ib, db) in fb.desc.chunks_exact(DESC_LEN).enumerate() {
+            for (ib, db) in fb.desc.as_chunks::<DESC_LEN>().0.iter().enumerate() {
                 let d = dist2(da, db);
                 if d < best {
                     second = best;
