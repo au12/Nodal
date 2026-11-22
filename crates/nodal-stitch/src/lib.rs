@@ -16,7 +16,6 @@ pub mod dense;
 pub mod features;
 pub mod fill;
 pub mod global;
-pub mod holes;
 pub mod io;
 pub mod lens;
 pub mod local;
