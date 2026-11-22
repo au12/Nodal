@@ -4,18 +4,27 @@
 //! estimate the lens and optimise orientations and distortion → (render) warp, balance exposure,
 //! find seams, blend, and fill pole gaps.
 
+// Numeric kernels index several parallel buffers at once; iterator chains would obscure them.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 pub mod align;
+pub mod blend;
 pub mod features;
 pub mod io;
 pub mod lens;
 pub mod matching;
 pub mod optimize;
+pub mod photometric;
 pub mod project;
+pub mod render;
+pub mod seam;
 pub mod synth;
+pub mod warp;
 
 pub use align::{AlignOptions, AlignReport};
 pub use lens::{Lens, LensKind};
 pub use project::{ControlPoint, OutputSettings, Project, SourceImage};
+pub use render::{render, Panorama, RenderOptions};
 
 use anyhow::Result;
 use features::{DetectOptions, FeatureSet};

@@ -278,7 +278,13 @@ fn refine(oct: &Octave, mut s: usize, mut y: usize, mut x: usize, opts: &DetectO
         let nx = x as isize + xc.round() as isize;
         let ny = y as isize + xr.round() as isize;
         let ns = s as isize + xi.round() as isize;
-        if ns < 1 || ns > S as isize || nx < BORDER as isize || ny < BORDER as isize || nx >= (w - BORDER) as isize || ny >= (h - BORDER) as isize {
+        if ns < 1
+            || ns > S as isize
+            || nx < BORDER as isize
+            || ny < BORDER as isize
+            || nx >= (w - BORDER) as isize
+            || ny >= (h - BORDER) as isize
+        {
             return None;
         }
         (x, y, s) = (nx as usize, ny as usize, ns as usize);

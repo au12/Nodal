@@ -7,10 +7,10 @@ Status legend: [x] done · [~] in progress · [ ] todo. Update this file with ev
 work can resume from a cold start.
 
 ## Milestones
-1. [~] `nodal-stitch` alignment: EXIF, lens models, SIFT features, matching, RANSAC, bundle adjustment,
+1. [x] `nodal-stitch` alignment: EXIF, lens models, SIFT features, matching, RANSAC, bundle adjustment,
    levelling, synthetic ground-truth tests
-2. [ ] Render: tiled warp, exposure/WB compensation, graph-cut seams, multi-band blending, output + XMP,
-   `nodal stitch` CLI
+2. [~] Render: tiled warp, exposure/WB compensation, graph-cut seams, multi-band blending, output + XMP
+   done; `nodal stitch` CLI and performance tuning (warp+blend ~3 MP/s on 2 cores) still to do
 3. [ ] Local alignment: guided matching, smooth per-image warp fields
 4. [ ] Pole patching: PatchMatch fill in pole-centred view
 5. [ ] GPU: live stitch preview shader, GPU warp path

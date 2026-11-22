@@ -156,7 +156,9 @@ impl SourceImage {
 pub fn rotation_from_ypr(yaw: f64, pitch: f64, roll: f64) -> Rotation3<f64> {
     let (y, p, r) = (yaw.to_radians(), pitch.to_radians(), roll.to_radians());
     // Yaw about +Y (turning right), then pitch about the camera's X (looking up), then roll about Z.
-    Rotation3::from_axis_angle(&V3::y_axis(), y) * Rotation3::from_axis_angle(&V3::x_axis(), -p) * Rotation3::from_axis_angle(&V3::z_axis(), r)
+    Rotation3::from_axis_angle(&V3::y_axis(), y)
+        * Rotation3::from_axis_angle(&V3::x_axis(), -p)
+        * Rotation3::from_axis_angle(&V3::z_axis(), r)
 }
 
 /// A pair of pixels in two images that show the same scene point.
@@ -253,7 +255,13 @@ pub struct Project {
 
 impl Default for Project {
     fn default() -> Self {
-        Project { version: PROJECT_VERSION, images: Vec::new(), lenses: Vec::new(), control_points: Vec::new(), output: OutputSettings::default() }
+        Project {
+            version: PROJECT_VERSION,
+            images: Vec::new(),
+            lenses: Vec::new(),
+            control_points: Vec::new(),
+            output: OutputSettings::default(),
+        }
     }
 }
 

@@ -126,8 +126,11 @@ pub fn match_guided(
                     }
                 }
             }
-            (best < max_dist && (second == u32::MAX || (best as f32) < ratio2 * second as f32))
-                .then_some(RawMatch { a: ia as u32, b: best_i, dist: best })
+            (best < max_dist && (second == u32::MAX || (best as f32) < ratio2 * second as f32)).then_some(RawMatch {
+                a: ia as u32,
+                b: best_i,
+                dist: best,
+            })
         })
         .collect();
     let mut best_for_b: Vec<Option<RawMatch>> = vec![None; fb.len()];
