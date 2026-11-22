@@ -1,0 +1,19 @@
+[package]
+name = "nodal-stitch"
+description = "Panorama stitching engine: feature matching, lens calibration, bundle adjustment, seam finding, multi-band blending and hole filling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+kamadak-exif = "0.6"
+nalgebra = { version = "0.34", default-features = false, features = ["std"] }
+rayon = "1.10"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jpeg-encoder = { version = "0.6", features = ["simd"] }
+
+[dev-dependencies]
+tempfile = "3"
