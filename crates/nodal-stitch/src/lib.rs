@@ -10,6 +10,7 @@
 pub mod align;
 pub mod blend;
 pub mod features;
+pub mod fill;
 pub mod io;
 pub mod lens;
 pub mod matching;
