@@ -22,11 +22,18 @@ Nodal now stitches. Drop in overlapping photos and get a finished panorama or to
 - **`nodal stitch`** command, with `--tour` to go from photos to a tour in one step
 - Panoramas are saved with Photo Sphere (GPano) metadata, and the tiler reads it, so partial panoramas keep their true field of view in tours
 - Partial panoramas are trimmed to a clean rectangle
+- **`nodal bench`** stitches a built-in synthetic photo set and prints timings and accuracy for the machine it runs on
+- The stats overlay (**I**) shows how many frames were drawn in the last second
 
 ### Changed
 
 - Dropping several photos that are not 2:1 panoramas opens the stitching workspace instead of creating a tour
 - The start screen offers *Stitch photos…* first
+- Idle auto-rotation draws at 30 fps, pauses while the window is in the background, and stops after three minutes without input. `autorotate.max_seconds` in a tour sets the limit; `0` rotates forever, for kiosks
+
+### Fixed
+
+- **Battery drain.** The viewer redrew at the display's full refresh rate for as long as a tour auto-rotated, even in the background. It now draws only when something on screen changes
 
 ### Known limitations
 
