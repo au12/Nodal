@@ -13,10 +13,12 @@ pub mod features;
 pub mod fill;
 pub mod io;
 pub mod lens;
+pub mod local;
 pub mod matching;
 pub mod optimize;
 pub mod photometric;
 pub mod project;
+pub mod refine;
 pub mod render;
 pub mod seam;
 pub mod synth;
@@ -71,6 +73,38 @@ pub fn align_sources(sources: &[Source], opts: &AlignOptions, progress: Progress
     let meta: Vec<_> = sources.iter().map(|s| (s.path.clone(), s.image.width(), s.image.height(), s.exif.clone())).collect();
     let mut project = align::new_project(&meta);
     let feats: Vec<FeatureSet> = sources.iter().map(|s| (*s.features).clone()).collect();
-    let report = align::align(&mut project, &feats, opts, progress)?;
+    let mut report = align::align(&mut project, &feats, &AlignOptions { level: false, ..opts.clone() }, &|f, s| progress(f * 0.8, s))?;
+    // Polish control points at full resolution, then re-optimise with the sharper measurements.
+    if project.control_points.len() >= 12 {
+        progress(0.82, "Refining control points");
+        let lumas: Vec<refine::Luma> = sources.par_iter().map(|s| refine::Luma::from_rgb(&s.image)).collect();
+        let before = report.rms;
+        let search = ((report.rms * 2.5).ceil() as i32).clamp(3, 12);
+        let refined = refine::refine_control_points(&mut project, &lumas, search);
+        if refined.refined > 0 {
+            progress(0.9, "Optimising");
+            let (rms, max) = align::polish(&mut project, opts);
+            report.log.push(format!(
+                "Sub-pixel refinement: {} points kept, {} dropped, RMS {:.2} → {:.2} px",
+                refined.refined, refined.rejected, before, rms
+            ));
+            report.rms = rms;
+            report.max = max;
+            report.control_points = project.control_points.len();
+        }
+    }
+    if opts.level {
+        align::level(&mut project);
+    }
+    if project.output.local_alignment {
+        let local = local::fit(&mut project);
+        if local.images_warped > 0 {
+            report.log.push(format!(
+                "Local alignment: RMS {:.2} → {:.2} px (largest correction {:.1} px)",
+                local.before, local.after, local.max_shift
+            ));
+        }
+        report.local = Some(local);
+    }
     Ok((project, report))
 }
