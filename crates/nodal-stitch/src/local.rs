@@ -21,6 +21,7 @@ pub struct LocalReport {
     pub images_warped: usize,
 }
 
+#[derive(Clone, Copy)]
 struct Sample {
     /// Where the agreed direction lands in this photo (full-resolution pixels).
     x: f32,
@@ -84,7 +85,7 @@ fn fit_field(samples: &mut [Sample], w: f32, h: f32) -> WarpField {
 }
 
 /// Source position that the warp maps onto `(x, y)`: solves `s + D(s) = (x, y)`.
-fn unwarp(field: Option<&WarpField>, x: f32, y: f32, w: f32, h: f32) -> (f32, f32) {
+pub fn unwarp(field: Option<&WarpField>, x: f32, y: f32, w: f32, h: f32) -> (f32, f32) {
     let Some(f) = field else { return (x, y) };
     let (mut sx, mut sy) = (x, y);
     for _ in 0..4 {
@@ -187,4 +188,73 @@ pub fn fit(project: &mut Project) -> LocalReport {
         report.max_shift = 0.0;
     }
     report
+}
+
+/// Fits local warps from dense overlap measurements. Every measured correspondence asks both
+/// photos to move toward the direction halfway between where the global model places them; each
+/// photo's field is a smooth regression of those requests that fades to zero away from overlaps.
+/// A field is kept only if it clearly reduces that photo's residual. Returns how many photos were
+/// warped.
+pub fn fit_dense(project: &mut Project, matches: &[crate::dense::DenseMatch]) -> usize {
+    use rayon::prelude::*;
+    for img in &mut project.images {
+        img.warp = None;
+    }
+    let n = project.images.len();
+    let models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
+    let rots: Vec<Rotation3<f64>> = project.images.iter().map(|i| i.rot()).collect();
+    let mut samples: Vec<Vec<Sample>> = (0..n).map(|_| Vec::new()).collect();
+    let mut used: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
+    for (k, m) in matches.iter().enumerate() {
+        let (a, b) = (m.a as usize, m.b as usize);
+        let (ma, mb) = (&models[project.images[a].lens], &models[project.images[b].lens]);
+        let da: V3 = rots[a] * ma.pixel_to_ray(m.ax as f64, m.ay as f64);
+        let db: V3 = rots[b] * mb.pixel_to_ray(m.bx as f64, m.by as f64);
+        let err = crate::global::vec_angle(&da, &db) * ma.f;
+        // Gross disagreements are motion or mismatches, not parallax.
+        if err > 0.02 * ma.w.max(ma.h) {
+            continue;
+        }
+        let mid = (da + db).normalize();
+        let (Some(ta), Some(tb)) = (ma.ray_to_pixel(rots[a].inverse() * mid), mb.ray_to_pixel(rots[b].inverse() * mid)) else { continue };
+        samples[a].push(Sample { x: ta.0 as f32, y: ta.1 as f32, dx: m.ax - ta.0 as f32, dy: m.ay - ta.1 as f32 });
+        samples[b].push(Sample { x: tb.0 as f32, y: tb.1 as f32, dx: m.bx - tb.0 as f32, dy: m.by - tb.1 as f32 });
+        used[a].push(k);
+        used[b].push(k);
+    }
+    // Thin very dense sample sets: the field has limited resolution anyway.
+    for s in samples.iter_mut() {
+        if s.len() > 4000 {
+            let step = s.len().div_ceil(4000);
+            let kept: Vec<Sample> = s.iter().step_by(step).map(|x| Sample { ..*x }).collect();
+            *s = kept;
+        }
+    }
+    let fields: Vec<Option<WarpField>> = samples
+        .par_iter_mut()
+        .enumerate()
+        .map(|(i, s)| {
+            if s.len() < 40 {
+                return None;
+            }
+            let img = &project.images[i];
+            let before: f64 = s.iter().map(|p| (p.dx * p.dx + p.dy * p.dy) as f64).sum::<f64>() / s.len() as f64;
+            // Nothing worth correcting.
+            if before.sqrt() < 0.35 {
+                return None;
+            }
+            let mut work: Vec<Sample> = s.iter().map(|x| Sample { ..*x }).collect();
+            let field = fit_field(&mut work, img.width as f32, img.height as f32);
+            let after: f64 = work.iter().map(|p| (p.dx * p.dx + p.dy * p.dy) as f64).sum::<f64>() / work.len() as f64;
+            (after < before * 0.8).then_some(field)
+        })
+        .collect();
+    let mut warped = 0;
+    for (img, f) in project.images.iter_mut().zip(fields) {
+        if f.is_some() {
+            warped += 1;
+        }
+        img.warp = f;
+    }
+    warped
 }

@@ -215,6 +215,15 @@ pub fn calibrate(project: &mut Project, sources: &[Source]) -> PhotoReport {
         _ => 0.0,
     }).collect();
     let lens_of: Vec<usize> = project.images.iter().map(|im| im.lens).collect();
+    let mut per_image = vec![0usize; n_img];
+    for s in &samples {
+        per_image[s.i as usize] += 1;
+        per_image[s.j as usize] += 1;
+    }
+    // When the camera recorded the exposure of every frame, trust it: real differences between
+    // frames shot at the same settings are a few hundredths of a stop, while flare, moving clouds
+    // and parallax easily fake tenths.
+    let exif_known = active.iter().all(|&i| ev[i].is_some());
 
     let solve = |target: &dyn Fn(&Sample) -> f64, with_vignetting: bool, fixed_vig: &[[f64; 3]], prior_w: f64| -> (DVector<f64>, f64, f64) {
         let mut x = DVector::<f64>::zeros(nv);
@@ -274,7 +283,7 @@ pub fn calibrate(project: &mut Project, sources: &[Source]) -> PhotoReport {
             // Priors: gains toward EXIF, vignetting toward zero, unused unknowns pinned.
             for k in 0..n_img {
                 let active_k = project.images[k].aligned && project.images[k].enabled;
-                let w = if active_k { prior_w } else { 1e6 };
+                let w = if active_k { prior_w * if exif_known { per_image[k].max(1) as f64 } else { 1.0 } } else { 1e6 };
                 let target = if active_k { prior[k] } else { 0.0 };
                 a[(k, k)] += w;
                 b[k] += w * (target - x[k]);
@@ -296,7 +305,7 @@ pub fn calibrate(project: &mut Project, sources: &[Source]) -> PhotoReport {
 
     // 1. Luminance: exposure and vignetting.
     let lum = |s: &Sample| luma(&s.ci).ln() - luma(&s.cj).ln();
-    let (x, rms0, rms1) = solve(&lum, true, &vec![[0.0; 3]; n_lens], 0.02);
+    let (x, rms0, rms1) = solve(&lum, true, &vec![[0.0; 3]; n_lens], if exif_known { 0.3 } else { 0.02 });
     let mut vig_log = vec![[0.0f64; 3]; n_lens];
     for l in 0..n_lens {
         for k in 0..3 {
@@ -320,7 +329,7 @@ pub fn calibrate(project: &mut Project, sources: &[Source]) -> PhotoReport {
     let mut chroma = vec![[0.0f64; 3]; n_img];
     for c in [0usize, 2] {
         let t = move |s: &Sample| ((s.ci[c] as f64).ln() - luma(&s.ci).ln()) - ((s.cj[c] as f64).ln() - luma(&s.cj).ln());
-        let (xc, _, _) = solve(&t, false, &vec![[0.0; 3]; n_lens], 0.5);
+        let (xc, _, _) = solve(&t, false, &vec![[0.0; 3]; n_lens], if exif_known { 0.3 } else { 0.5 });
         for i in 0..n_img {
             chroma[i][c] = xc[i].clamp(-0.3, 0.3);
         }
