@@ -27,17 +27,36 @@ impl Plane {
 
 /// Burt–Adelson reduce: 5-tap binomial filter, then keep even samples. Borders clamp.
 pub fn reduce(src: &Plane) -> Plane {
+    reduce_weighted(src, None)
+}
+
+/// Reduce of `src × weight` (per-pixel weight plane with one channel), without materialising the product.
+pub fn reduce_weighted(src: &Plane, weight: Option<&Plane>) -> Plane {
     let (w, h, c) = (src.w, src.h, src.c);
     let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
     // Horizontal.
     let mut tmp = Plane::new(nw, h, c);
-    tmp.data.par_chunks_mut(nw * c).zip(src.data.par_chunks(w * c)).for_each(|(out, row)| {
+    tmp.data.par_chunks_mut(nw * c).zip(src.data.par_chunks(w * c)).enumerate().for_each(|(y, (out, row))| {
+        let wrow = weight.map(|p| &p.data[y * w..(y + 1) * w]);
         for x in 0..nw {
             let xc = 2 * x;
-            let i = |d: isize| ((xc as isize + d).clamp(0, w as isize - 1) as usize) * c;
-            let (a, b, m, d, e) = (i(-2), i(-1), i(0), i(1), i(2));
-            for k in 0..c {
-                out[x * c + k] = (row[a + k] + row[e + k] + 4.0 * (row[b + k] + row[d + k]) + 6.0 * row[m + k]) * (1.0 / 16.0);
+            let ix = |d: isize| (xc as isize + d).clamp(0, w as isize - 1) as usize;
+            let (a, b, m, d, e) = (ix(-2), ix(-1), ix(0), ix(1), ix(2));
+            match wrow {
+                None => {
+                    for k in 0..c {
+                        out[x * c + k] = (row[a * c + k] + row[e * c + k] + 4.0 * (row[b * c + k] + row[d * c + k]) + 6.0 * row[m * c + k])
+                            * (1.0 / 16.0);
+                    }
+                }
+                Some(wr) => {
+                    let (wa, wb, wm, wd, we) = (wr[a], 4.0 * wr[b], 6.0 * wr[m], 4.0 * wr[d], wr[e]);
+                    for k in 0..c {
+                        out[x * c + k] =
+                            (row[a * c + k] * wa + row[e * c + k] * we + row[b * c + k] * wb + row[d * c + k] * wd + row[m * c + k] * wm)
+                                * (1.0 / 16.0);
+                    }
+                }
             }
         }
     });
@@ -110,16 +129,9 @@ pub fn extrapolated_pyramid(rgb: Plane, alpha: Plane, levels: usize) -> Vec<Plan
     let mut a = vec![alpha];
     // Pull: alpha-weighted averages.
     for l in 0..levels {
-        let mut pre = g[l].clone();
-        if l > 0 {
-            // Levels above 0 hold normalised colour; premultiply again by their coverage.
-            pre.data.par_chunks_mut(3).zip(a[l].data.par_iter()).for_each(|(p, &al)| {
-                p[0] *= al;
-                p[1] *= al;
-                p[2] *= al;
-            });
-        }
-        let mut next = reduce(&pre);
+        // Level 0 arrives premultiplied (zero where uncovered); coarser levels hold normalised
+        // colour and are weighted by their coverage again.
+        let mut next = if l == 0 { reduce(&g[0]) } else { reduce_weighted(&g[l], Some(&a[l])) };
         let next_a = reduce(&a[l]);
         next.data.par_chunks_mut(3).zip(next_a.data.par_iter()).for_each(|(p, &al)| {
             if al > 1e-6 {
@@ -183,57 +195,84 @@ impl Blender {
     pub fn feed(&mut self, x0: i64, y0: i64, w: usize, h: usize, rgb: Vec<f32>, alpha: Vec<f32>, mask: Vec<f32>) {
         let levels = self.levels;
         debug_assert!(w.is_multiple_of(self.align()) && h.is_multiple_of(self.align()));
-        let g = extrapolated_pyramid(Plane { w, h, c: 3, data: rgb }, Plane { w, h, c: 1, data: alpha }, levels);
+        // Pull: coverage-weighted Gaussian pyramid.
+        let mut g = vec![Plane { w, h, c: 3, data: rgb }];
+        let mut a = vec![Plane { w, h, c: 1, data: alpha }];
         let mut m = vec![Plane { w, h, c: 1, data: mask }];
         for l in 0..levels {
-            let next = reduce(&m[l]);
-            m.push(next);
+            let mut next = if l == 0 { reduce(&g[0]) } else { reduce_weighted(&g[l], Some(&a[l])) };
+            let next_a = reduce(&a[l]);
+            next.data.par_chunks_mut(3).zip(next_a.data.par_iter()).for_each(|(p, &al)| {
+                if al > 1e-6 {
+                    let inv = 1.0 / al;
+                    p[0] *= inv;
+                    p[1] *= inv;
+                    p[2] *= inv;
+                } else {
+                    p.fill(0.0);
+                }
+            });
+            g.push(next);
+            a.push(next_a);
+            let next_m = reduce(&m[l]);
+            m.push(next_m);
         }
-        for l in 0..=levels {
-            // Band-pass content of this level.
-            let lap = if l < levels {
-                let e = expand(&g[l + 1], g[l].w, g[l].h);
-                let mut d = g[l].clone();
-                d.data.par_iter_mut().zip(e.data.par_iter()).for_each(|(a, b)| *a -= b);
-                d
-            } else {
-                g[l].clone()
-            };
-            let (lx0, ly0) = (x0 >> l, y0 >> l);
-            let (acc, wsum) = (&mut self.acc[l], &mut self.wsum[l]);
-            let (aw, ah) = (acc.w as i64, acc.h as i64);
-            let (lw, lh) = (lap.w, lap.h);
-            let mask = &m[l];
-            // Rows of the layer that fall inside the canvas.
-            let y_start = (-ly0).max(0) as usize;
-            let y_end = ((ah - ly0).min(lh as i64)).max(0) as usize;
-            let x_start = (-lx0).max(0) as usize;
-            let x_end = ((aw - lx0).min(lw as i64)).max(0) as usize;
-            if y_start >= y_end || x_start >= x_end {
-                continue;
-            }
-            let dst_x = (lx0 + x_start as i64) as usize;
-            let dst_y = (ly0 + y_start as i64) as usize;
-            let n = x_end - x_start;
-            acc.data.par_chunks_mut(acc.w * 3).zip(wsum.data.par_chunks_mut(acc.w)).skip(dst_y).take(y_end - y_start).enumerate().for_each(
-                |(i, (arow, wrow))| {
-                    let ly = y_start + i;
-                    let lrow = &lap.data[(ly * lw + x_start) * 3..(ly * lw + x_end) * 3];
-                    let mrow = &mask.data[ly * lw + x_start..ly * lw + x_end];
-                    let arow = &mut arow[dst_x * 3..(dst_x + n) * 3];
-                    let wrow = &mut wrow[dst_x..dst_x + n];
-                    for k in 0..n {
-                        let mv = mrow[k];
-                        if mv > 0.0 {
-                            arow[k * 3] += lrow[k * 3] * mv;
-                            arow[k * 3 + 1] += lrow[k * 3 + 1] * mv;
-                            arow[k * 3 + 2] += lrow[k * 3 + 2] * mv;
-                            wrow[k] += mv;
-                        }
+        // Push, coarse to fine: fill uncovered pixels from the coarser level, form each band as
+        // (level − expanded coarser level) and add it to the output weighted by the mask.
+        self.accumulate(levels, x0, y0, &g[levels], &m[levels]);
+        for l in (0..levels).rev() {
+            let mut e = expand(&g[l + 1], g[l].w, g[l].h);
+            let al = &a[l];
+            g[l].data.par_chunks_mut(3).zip(e.data.par_chunks_mut(3)).zip(al.data.par_iter()).for_each(|((p, q), &wgt)| {
+                let wgt = wgt.min(1.0);
+                for k in 0..3 {
+                    let v = p[k] * wgt + q[k] * (1.0 - wgt);
+                    p[k] = v;
+                    q[k] = v - q[k];
+                }
+            });
+            g.truncate(l + 1); // the coarser level is no longer needed
+            self.accumulate(l, x0, y0, &e, &m[l]);
+        }
+    }
+
+    fn accumulate(&mut self, l: usize, x0: i64, y0: i64, band: &Plane, mask: &Plane) {
+        let (lx0, ly0) = (x0 >> l, y0 >> l);
+        let (acc, wsum) = (&mut self.acc[l], &mut self.wsum[l]);
+        let (aw, ah) = (acc.w as i64, acc.h as i64);
+        let (lw, lh) = (band.w, band.h);
+        // Part of the layer that falls inside the canvas.
+        let y_start = (-ly0).max(0) as usize;
+        let y_end = ((ah - ly0).min(lh as i64)).max(0) as usize;
+        let x_start = (-lx0).max(0) as usize;
+        let x_end = ((aw - lx0).min(lw as i64)).max(0) as usize;
+        if y_start >= y_end || x_start >= x_end {
+            return;
+        }
+        let dst_x = (lx0 + x_start as i64) as usize;
+        let dst_y = (ly0 + y_start as i64) as usize;
+        let n = x_end - x_start;
+        let stride = acc.w;
+        acc.data[dst_y * stride * 3..(dst_y + y_end - y_start) * stride * 3]
+            .par_chunks_mut(stride * 3)
+            .zip(wsum.data[dst_y * stride..(dst_y + y_end - y_start) * stride].par_chunks_mut(stride))
+            .enumerate()
+            .for_each(|(i, (arow, wrow))| {
+                let ly = y_start + i;
+                let lrow = &band.data[(ly * lw + x_start) * 3..(ly * lw + x_end) * 3];
+                let mrow = &mask.data[ly * lw + x_start..ly * lw + x_end];
+                let arow = &mut arow[dst_x * 3..(dst_x + n) * 3];
+                let wrow = &mut wrow[dst_x..dst_x + n];
+                for k in 0..n {
+                    let mv = mrow[k];
+                    if mv > 0.0 {
+                        arow[k * 3] += lrow[k * 3] * mv;
+                        arow[k * 3 + 1] += lrow[k * 3 + 1] * mv;
+                        arow[k * 3 + 2] += lrow[k * 3 + 2] * mv;
+                        wrow[k] += mv;
                     }
-                },
-            );
-        }
+                }
+            });
     }
 
     /// Collapses the pyramid. Returns RGB (3 floats per pixel, 8-bit units) and the level-0 weight

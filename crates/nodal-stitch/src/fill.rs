@@ -175,6 +175,10 @@ struct Level {
     sources: Vec<u32>,
     /// Local structure strength in [0, 1] (0 = smooth, 1 = strongly textured), from detail energy.
     rho: Vec<f32>,
+    /// Local detail energy (same units as patch distances).
+    energy: Vec<f32>,
+    /// How deep inside the gap each pixel is: 0 at the rim, 1 at the centre.
+    depth: Vec<f32>,
     /// How many target patches currently borrow from each source patch.
     usage: Vec<AtomicU32>,
     /// Cost added per extra borrower of the same source: spreads use across all the available
@@ -225,8 +229,8 @@ fn finish_level(w: usize, h: usize, image: &[f32], base: Vec<f32>, known: Vec<bo
     }
     let sources: Vec<u32> = (0..w * h).filter(|&i| source[i]).map(|i| i as u32).collect();
     let usage = (0..w * h).map(|_| AtomicU32::new(0)).collect();
-    // Structure strength: RMS detail in a 7×7 window over known pixels.
-    let rho: Vec<f32> = (0..w * h)
+    // Local detail energy in a 7×7 window over known pixels, and the structure strength from it.
+    let energy: Vec<f32> = (0..w * h)
         .into_par_iter()
         .map(|i| {
             let (x, y) = ((i % w) as isize, (i / w) as isize);
@@ -240,20 +244,61 @@ fn finish_level(w: usize, h: usize, image: &[f32], base: Vec<f32>, known: Vec<bo
                     let j = (yy * w as isize + xx) as usize;
                     if known[j] {
                         let d = &detail[j * 3..j * 3 + 3];
-                        sum += (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) / 3.0;
+                        sum += d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                         n += 1;
                     }
                 }
             }
             if n == 0 {
-                return 0.0;
+                0.0
+            } else {
+                sum / n as f32
             }
-            let rms = (sum / n as f32).sqrt();
+        })
+        .collect();
+    let rho: Vec<f32> = energy
+        .iter()
+        .map(|e| {
+            let rms = (e / 3.0).sqrt();
             let t = ((rms - 5.0) / 15.0).clamp(0.0, 1.0);
             t * t * (3.0 - 2.0 * t)
         })
         .collect();
-    Level { w, h, detail, base, known, hole, target, source, sources, rho, usage, reuse_cost: 0.0 }
+    // Depth inside the gap (breadth-first distance from its rim, normalised).
+    let mut dist = vec![u32::MAX; w * h];
+    let mut frontier: Vec<usize> = Vec::new();
+    for i in 0..w * h {
+        if !hole[i] {
+            continue;
+        }
+        let (x, y) = (i % w, i / w);
+        let rim = (x > 0 && !hole[i - 1]) || (x + 1 < w && !hole[i + 1]) || (y > 0 && !hole[i - w]) || (y + 1 < h && !hole[i + w]);
+        if rim {
+            dist[i] = 0;
+            frontier.push(i);
+        }
+    }
+    let mut d = 0u32;
+    while !frontier.is_empty() {
+        d += 1;
+        let mut next = Vec::new();
+        for &i in &frontier {
+            let (x, y) = (i % w, i / w);
+            for j in [(x > 0).then(|| i - 1), (x + 1 < w).then_some(i + 1), (y > 0).then(|| i - w), (y + 1 < h).then_some(i + w)]
+                .into_iter()
+                .flatten()
+            {
+                if hole[j] && dist[j] == u32::MAX {
+                    dist[j] = d;
+                    next.push(j);
+                }
+            }
+        }
+        frontier = next;
+    }
+    let max_d = d.max(1) as f32;
+    let depth: Vec<f32> = dist.iter().map(|&v| if v == u32::MAX { 0.0 } else { v as f32 / max_d }).collect();
+    Level { w, h, detail, base, known, hole, target, source, sources, rho, energy, depth, usage, reuse_cost: 0.0 }
 }
 
 /// Patch distance between target patch `p` and source patch `q`, abandoning once above `limit`.
@@ -326,6 +371,15 @@ fn coherence_factor(l: &Level, nnf: &[(i32, i32)], p: (isize, isize), q: (i32, i
     1.0 - COHERENCE * same as f32 / 4.0
 }
 
+/// Prior cost of placing source patch `q` at target `p`: deep inside the gap, plain material is
+/// preferred over busy material. Structure may continue a little way in from the rim, but the
+/// unknown middle is filled with the calmest material around (sky rather than rooftops). Where
+/// everything around is equally textured the term is the same for every candidate and has no effect.
+#[inline]
+fn structure_prior(l: &Level, p: usize, q: usize) -> f32 {
+    l.energy[q] * (l.depth[p] * 2.5).min(1.0)
+}
+
 /// One PatchMatch sweep (propagation + random search), parallel over horizontal strips.
 fn search(l: &Level, nnf: &mut [(i32, i32)], cost: &mut [f32], iter: usize, seed: u64, max_radius: f32) {
     let (w, h) = (l.w, l.h);
@@ -356,7 +410,8 @@ fn search(l: &Level, nnf: &mut [(i32, i32)], cost: &mut [f32], iter: usize, seed
                         return;
                     }
                     let factor = coherence_factor(l, &snapshot, p, (qx, qy));
-                    let reuse = l.reuse_cost * l.usage[qy as usize * w + qx as usize].load(Ordering::Relaxed) as f32;
+                    let reuse = l.reuse_cost * l.usage[qy as usize * w + qx as usize].load(Ordering::Relaxed) as f32
+                        + structure_prior(l, i, qy as usize * w + qx as usize);
                     if reuse >= *best_c {
                         return;
                     }
@@ -465,7 +520,9 @@ fn recompute_costs(l: &Level, nnf: &[(i32, i32)], cost: &mut [f32]) {
             let q = nnf[i];
             let p = ((i % w) as isize, (i / w) as isize);
             let others = l.usage[q.1 as usize * w + q.0 as usize].load(Ordering::Relaxed).saturating_sub(1) as f32;
-            *c = patch_dist(l, p, (q.0 as isize, q.1 as isize), f32::INFINITY) * coherence_factor(l, nnf, p, q) + l.reuse_cost * others;
+            *c = patch_dist(l, p, (q.0 as isize, q.1 as isize), f32::INFINITY) * coherence_factor(l, nnf, p, q)
+                + l.reuse_cost * others
+                + structure_prior(l, i, q.1 as usize * w + q.0 as usize);
         }
     });
 }
@@ -518,7 +575,7 @@ fn onion_init(l: &mut Level, nnf: &mut [(i32, i32)]) {
                 let mut best = (f32::INFINITY, cands[0]);
                 for &q in &cands {
                     let (qx, qy) = ((q as usize % w) as isize, (q as usize / w) as isize);
-                    let mut sum = 0.0f32;
+                    let mut sum = structure_prior(l, i, q as usize) * offs.len() as f32;
                     for &(dx, dy, ti) in &offs {
                         let si = ((qy + dy) * w as isize + qx + dx) as usize;
                         let rho = l.rho[si];
