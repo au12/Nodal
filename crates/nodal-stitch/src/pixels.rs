@@ -147,6 +147,36 @@ impl LinearImage {
     }
 }
 
+/// Share of 8×8 blocks of an 8-bit photo whose luma varies by at least `min_contrast` levels
+/// (standard deviation). Clear sky, fog or a blank wall score near zero.
+pub fn textured_share(img: &image::RgbImage, min_contrast: f32) -> f32 {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let raw = img.as_raw();
+    let (bw, bh) = (w / 8, h / 8);
+    if bw == 0 || bh == 0 {
+        return 0.0;
+    }
+    let mut textured = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let (mut s, mut s2) = (0.0f32, 0.0f32);
+            for y in by * 8..by * 8 + 8 {
+                for x in bx * 8..bx * 8 + 8 {
+                    let i = (y * w + x) * 3;
+                    let l = 0.299 * raw[i] as f32 + 0.587 * raw[i + 1] as f32 + 0.114 * raw[i + 2] as f32;
+                    s += l;
+                    s2 += l * l;
+                }
+            }
+            let m = s / 64.0;
+            if (s2 / 64.0 - m * m).max(0.0).sqrt() >= min_contrast {
+                textured += 1;
+            }
+        }
+    }
+    textured as f32 / (bw * bh) as f32
+}
+
 /// Separable exact-area resampling of an interleaved `c`-channel image (shrinking only).
 pub fn resize_area(src: &[f32], w: usize, h: usize, c: usize, nw: usize, nh: usize) -> Vec<f32> {
     // Horizontal pass.

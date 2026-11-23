@@ -94,6 +94,8 @@ pub struct AlignReport {
     pub rms: f64,
     pub max: f64,
     pub unaligned: Vec<usize>,
+    /// Photos with nothing to match, placed from the shooting pattern instead.
+    pub estimated: Vec<usize>,
     /// Where each lens's starting field of view came from.
     pub lens_source: Vec<LensSource>,
     pub log: Vec<String>,
@@ -160,6 +162,7 @@ pub fn new_project(images: &[(PathBuf, u32, u32, ExifInfo)]) -> Project {
             lens,
             rotation: [0.0, 0.0, 0.0, 1.0],
             aligned: false,
+            estimated: false,
             enabled: true,
             gain: [1.0; 3],
             warp: None,
@@ -320,6 +323,58 @@ fn estimate_lens(
     best
 }
 
+/// Compares names the way people number files: "pano 2" before "pano 10".
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, _) => return std::cmp::Ordering::Less,
+            (_, None) => return std::cmp::Ordering::Greater,
+            (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let take = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut s = String::new();
+                    while let Some(c) = it.peek().copied().filter(|c| c.is_ascii_digit()) {
+                        s.push(c);
+                        it.next();
+                    }
+                    s
+                };
+                let (na, nb) = (take(&mut x), take(&mut y));
+                let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
+                let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)).then_with(|| na.len().cmp(&nb.len()));
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(c), Some(d)) => {
+                let ord = c.to_ascii_lowercase().cmp(&d.to_ascii_lowercase());
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+                x.next();
+                y.next();
+            }
+        }
+    }
+}
+
+/// Photos in the order they were taken: EXIF time, then file name (numbers compared as numbers).
+fn capture_order(project: &Project) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..project.images.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (ia, ib) = (&project.images[a], &project.images[b]);
+        ia.exif
+            .taken
+            .as_deref()
+            .unwrap_or("")
+            .cmp(ib.exif.taken.as_deref().unwrap_or(""))
+            .then_with(|| natural_cmp(&ia.name, &ib.name))
+            .then(a.cmp(&b))
+    });
+    order
+}
+
 /// Learned matching between photos the SIFT pass left in separate groups. Tries capture-order
 /// neighbours and pairs SIFT half-matched first, then the pairs whose learned descriptors agree
 /// most, and keeps every pair a rotation explains.
@@ -333,12 +388,7 @@ fn rescue_pass(
     progress: Progress,
 ) {
     let n = project.images.len();
-    // Capture order: EXIF time, then file name.
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        let (ia, ib) = (&project.images[a], &project.images[b]);
-        (ia.exif.taken.as_deref().unwrap_or(""), &ia.name, a).cmp(&(ib.exif.taken.as_deref().unwrap_or(""), &ib.name, b))
-    });
+    let order = capture_order(project);
     let mut pos = vec![0usize; n];
     for (k, &i) in order.iter().enumerate() {
         pos[i] = k;
@@ -812,6 +862,7 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
     let mut report = AlignReport::default();
     for img in &mut project.images {
         img.aligned = false;
+        img.estimated = false;
         img.warp = None;
         img.rotation = [0.0, 0.0, 0.0, 1.0];
     }
@@ -1195,11 +1246,109 @@ fn held_out_error(project: &Project, held: &[ControlPoint]) -> f64 {
     (keep.iter().map(|x| x * x).sum::<f64>() / keep.len() as f64).sqrt()
 }
 
+/// Yaw, pitch and roll in degrees (the inverse of [`crate::project::rotation_from_ypr`]).
+pub fn ypr(r: &Rotation3<f64>) -> (f64, f64, f64) {
+    let d = r * V3::z();
+    let pitch = d.y.clamp(-1.0, 1.0).asin();
+    let yaw = d.x.atan2(d.z);
+    let m = Rotation3::from_axis_angle(&V3::x_axis(), pitch) * Rotation3::from_axis_angle(&V3::y_axis(), -yaw) * r;
+    let roll = m[(1, 0)].atan2(m[(0, 0)]);
+    (yaw.to_degrees(), pitch.to_degrees(), roll.to_degrees())
+}
+
+/// Places photos that have nothing to match (`featureless`: clear sky, a blank wall) from the
+/// shooting pattern: between their capture-order neighbours along the row they share, or one
+/// typical step beyond the last placed photo of the row. A guess is kept only where it fills a
+/// gap; one that would land on photos already placed is dropped (it belongs somewhere else,
+/// such as an unmatched zenith shot). Call on a levelled project. Returns the photos placed.
+pub fn place_by_pattern(project: &mut Project, featureless: &[bool]) -> Vec<usize> {
+    let n = project.images.len();
+    let solid = |p: &Project, i: usize| p.images[i].aligned && !p.images[i].estimated && p.images[i].enabled;
+    let order = capture_order(project);
+    let angles: Vec<Option<(f64, f64, f64)>> = (0..n).map(|i| solid(project, i).then(|| ypr(&project.images[i].rot()))).collect();
+    let wrap = |d: f64| (d + 180.0).rem_euclid(360.0) - 180.0;
+    // Typical step between consecutive shots of a row.
+    let mut steps: Vec<f64> = order
+        .windows(2)
+        .filter_map(|w| {
+            let (a, b) = (angles[w[0]]?, angles[w[1]]?);
+            ((b.1 - a.1).abs() < 12.0 && a.1.abs() < 70.0).then(|| wrap(b.0 - a.0))
+        })
+        .filter(|d| d.abs() > 3.0)
+        .collect();
+    if steps.is_empty() {
+        return Vec::new();
+    }
+    steps.sort_by(|a, b| a.total_cmp(b));
+    let step = steps[steps.len() / 2];
+    let models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
+    let mut placed = Vec::new();
+    let mut k = 0;
+    while k < order.len() {
+        if angles[order[k]].is_some() || !featureless[order[k]] || !project.images[order[k]].enabled {
+            k += 1;
+            continue;
+        }
+        // A run of unplaced, featureless photos between placed neighbours p and q.
+        let start = k;
+        while k < order.len() && angles[order[k]].is_none() && featureless[order[k]] && project.images[order[k]].enabled {
+            k += 1;
+        }
+        let run: Vec<usize> = order[start..k].to_vec();
+        if run.len() > 12 {
+            continue;
+        }
+        let p = start.checked_sub(1).and_then(|i| angles[order[i]]);
+        let q = order.get(k).and_then(|&i| angles[i]);
+        let len = run.len() as f64;
+        for (t, &i) in run.iter().enumerate() {
+            let t = (t + 1) as f64;
+            let guess = match (p, q) {
+                (Some(p), Some(q)) if (p.1 - q.1).abs() < 20.0 => {
+                    let total = if step > 0.0 { (q.0 - p.0).rem_euclid(360.0) } else { -(p.0 - q.0).rem_euclid(360.0) };
+                    let d = total / (len + 1.0);
+                    let d = if (0.4..2.5).contains(&(d / step)) { d } else { step };
+                    let f = t / (len + 1.0);
+                    (p.0 + d * t, p.1 + (q.1 - p.1) * f, p.2 + wrap(q.2 - p.2) * f)
+                }
+                (Some(p), _) => (p.0 + step * t, p.1, p.2),
+                (None, Some(q)) => (q.0 - step * (len + 1.0 - t), q.1, q.2),
+                _ => continue,
+            };
+            let r = crate::project::rotation_from_ypr(guess.0, guess.1, guess.2);
+            // Keep it only where it fills a gap: most of the frame must be unseen by placed photos.
+            let m = &models[project.images[i].lens];
+            const G: usize = 8;
+            let mut seen = 0;
+            for gy in 0..G {
+                for gx in 0..G {
+                    let d = r * m.pixel_to_ray((gx as f64 + 0.5) / G as f64 * m.w, (gy as f64 + 0.5) / G as f64 * m.h);
+                    let covered = (0..n).any(|j| {
+                        solid(project, j) && {
+                            let mj = &models[project.images[j].lens];
+                            mj.ray_to_pixel(project.images[j].rot().inverse() * d).is_some_and(|(x, y)| mj.contains(x, y))
+                        }
+                    });
+                    seen += covered as usize;
+                }
+            }
+            if seen > G * G * 6 / 10 {
+                continue;
+            }
+            project.images[i].set_rot(&r);
+            project.images[i].aligned = true;
+            project.images[i].estimated = true;
+            placed.push(i);
+        }
+    }
+    placed
+}
+
 /// Final optimisation pass after control points have been refined: tight robust threshold, all
 /// lens parameters the data supports, outliers dropped. Returns (RMS, max) in source pixels.
 pub fn polish(project: &mut Project, opts: &AlignOptions) -> (f64, f64) {
     let n = project.images.len();
-    let anchor = (0..n).find(|&i| project.images[i].aligned).unwrap_or(0);
+    let anchor = (0..n).find(|&i| project.images[i].aligned && !project.images[i].estimated).unwrap_or(0);
     let mut fixed = vec![false; n];
     fixed[anchor] = true;
     for (i, img) in project.images.iter().enumerate() {
@@ -1300,4 +1449,24 @@ fn guided_points(project: &mut Project, features: &[FeatureSet], opts: &AlignOpt
     out.sort_by_key(|c| (c.a, c.b));
     project.control_points = out;
     project.control_points.len().saturating_sub(before).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn natural_order_compares_numbers_as_numbers() {
+        let mut names = vec!["b10.jpg", "b2.jpg", "b1.jpg", "IMG_0010.CR3", "IMG_0009.CR3", "b02.jpg"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(names, vec!["b1.jpg", "b2.jpg", "b02.jpg", "b10.jpg", "IMG_0009.CR3", "IMG_0010.CR3"]);
+    }
+
+    #[test]
+    fn ypr_inverts_rotation_from_ypr() {
+        for &(y, p, r) in &[(10.0, 20.0, -5.0), (-170.0, -45.0, 3.0), (95.0, 60.0, 12.0)] {
+            let (y2, p2, r2) = ypr(&crate::project::rotation_from_ypr(y, p, r));
+            assert!((y - y2).abs() < 1e-6 && (p - p2).abs() < 1e-6 && (r - r2).abs() < 1e-6, "{y} {p} {r} -> {y2} {p2} {r2}");
+        }
+    }
 }

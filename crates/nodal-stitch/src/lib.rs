@@ -339,6 +339,21 @@ pub fn align_sources(sources: &[Source], opts: &AlignOptions, progress: Progress
     }
     if opts.level {
         align::level(&mut project);
+        // Photos with nothing to match (clear sky) still belong in the panorama: place them from
+        // the shooting pattern where they fill a gap, and say so.
+        if !report.unaligned.is_empty() {
+            let featureless: Vec<bool> = sources.iter().map(|s| pixels::textured_share(&s.image, 4.0) < 0.1).collect();
+            let placed = align::place_by_pattern(&mut project, &featureless);
+            if !placed.is_empty() {
+                report.log.push(format!(
+                    "Placed {} featureless photo(s) from the shooting pattern: {}",
+                    placed.len(),
+                    placed.iter().map(|&i| project.images[i].name.clone()).collect::<Vec<_>>().join(", ")
+                ));
+                report.unaligned.retain(|i| !placed.contains(i));
+                report.estimated = placed;
+            }
+        }
     }
     lap(&mut report, "control point refinement");
     // Dense registration of every overlap: thousands of evenly spread measurements for a second

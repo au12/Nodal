@@ -346,6 +346,10 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                     if ext == "jpg" || ext == "jpeg" { " (black in JPEG; use .png or .tif to keep them transparent)" } else { "" }
                 );
             }
+            if !report.estimated.is_empty() {
+                let names: Vec<&str> = report.estimated.iter().map(|&i| proj.images[i].name.as_str()).collect();
+                println!("  placed from the shooting pattern (nothing to match, e.g. clear sky): {}", names.join(", "));
+            }
             for i in &report.unaligned {
                 println!("  warning: {} does not overlap the others enough and was left out", proj.images[*i].name);
             }
