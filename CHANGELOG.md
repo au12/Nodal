@@ -4,6 +4,55 @@ All notable changes to Nodal are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+The stitching engine, rebuilt. RAW in, 16-bit out, every photo placed, and alignment measured against
+ground truth instead of trusted.
+
+### Added
+
+- **RAW, TIFF and PSD input.** RAW from most cameras through FlashRaw (CR3, CR2, NEF, ARW, RAF, DNG,
+  ORF, RW2…), 8/16/32-bit TIFF including BigTIFF, Photoshop PSD/PSB. Embedded ICC profiles are
+  honoured; RAW frames of a set share one white balance
+- **Scene-linear float pipeline** end to end, blending in a perceptual space, and **16-bit output**:
+  TIFF (BigTIFF when large), PNG and PSD/PSB, with an sRGB ICC profile and GPano metadata
+- **Fisheye projection calibration.** The projection factor (equidistant, equisolid, stereographic or
+  in between) is measured from the photos, so the lens no longer has to be named
+- **Learned rescue matching** (desktop app and CLI): RaCo-ALIKED keypoints with LightGlue on ONNX
+  Runtime for photos SIFT cannot connect (low texture, cloudy sky, repeated patterns). Models (65 MB)
+  download once from pinned revisions, checked by SHA-256. `--no-learned` and a workspace switch turn
+  it off
+- **Global placement** by robust rotation averaging with cycle checks, and a focal-length search that
+  closes 360° rings
+- **Dense overlap registration.** Every overlap is measured densely and sub-pixel after the global
+  solve; it feeds a second adjustment, local warps for hand-held parallax, and the overlap check in the
+  workspace
+- **Photometric calibration:** exposure, white balance and vignetting solved jointly from the overlaps
+- **Ghost masks.** Moving people and shadows are found by consensus and kept out of seams and blending
+- **Void filling** for any gap between photos, not just the poles, with a *Fill voids* switch to leave
+  them transparent instead
+- **Featureless photos** (clear sky, blank walls) are placed from the shooting pattern where they fill
+  a gap, and flagged
+- **Workspace:** residual heat map on the preview, per-photo agreement dots, the weakest links by
+  name, a mask painter, and read-outs for the overlap check, learned matches, pattern-placed photos and
+  exposure match
+- **`nodal bench --suite`:** an accuracy suite scored by true misregistration against ground truth
+  (fisheye families the solver is not told, a low-texture sphere, a partial panorama), with `--json`
+
+### Changed
+
+- Lens calibration stages are kept only when they lower the error on held-out control points
+- Full-resolution photos are streamed from disk during rendering; RAWs are decoded at half size when
+  the output cannot use more
+- Pruning outliers never splits the panorama into disconnected groups
+- Photos are ordered by capture time, then by file name with numbers compared as numbers
+
+### Fixed
+
+- Dense measurements taken against a rough model were biased towards it; feature points are now
+  refined to sub-pixel first (fisheye test set: true misregistration 2.1 px → 0.03 px median)
+- The ring check behind the focal-length search failed when the reference photo pointed steeply up or
+  down, and its clarity test was swamped by photos outside the group
+- Output ICC profiles were rejected by some readers (libpng warnings); they are now hand-built ICC v2
+
 ## [0.2.0] - 2026-11-22
 
 Nodal now stitches. Drop in overlapping photos and get a finished panorama or tour: alignment, lens calibration, blending and pole patching are automatic.

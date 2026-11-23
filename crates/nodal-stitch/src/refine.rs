@@ -11,14 +11,23 @@ use image::RgbImage;
 use nalgebra::Rotation3;
 use rayon::prelude::*;
 
-/// Full-resolution luma plane.
+/// Luma plane of a photo (possibly a reduced working copy).
 pub struct Luma {
     pub w: usize,
     pub h: usize,
     pub data: Vec<u8>,
+    /// Plane pixels per full-resolution pixel.
+    pub scale: f32,
 }
 
 impl Luma {
+    /// Luma of a working copy that is `scale` times the photo's full size.
+    pub fn from_rgb_scaled(img: &RgbImage, scale: f32) -> Luma {
+        let mut l = Luma::from_rgb(img);
+        l.scale = scale;
+        l
+    }
+
     pub fn from_rgb(img: &RgbImage) -> Luma {
         let (w, h) = (img.width() as usize, img.height() as usize);
         let mut data = vec![0u8; w * h];
@@ -27,12 +36,12 @@ impl Luma {
                 *d = ((77 * p[0] as u32 + 150 * p[1] as u32 + 29 * p[2] as u32) >> 8) as u8;
             }
         });
-        Luma { w, h, data }
+        Luma { w, h, data, scale: 1.0 }
     }
 
     #[inline]
     fn sample(&self, x: f32, y: f32) -> Option<f32> {
-        let (fx, fy) = (x - 0.5, y - 0.5);
+        let (fx, fy) = (x * self.scale - 0.5, y * self.scale - 0.5);
         if fx < 0.0 || fy < 0.0 || fx >= (self.w - 1) as f32 || fy >= (self.h - 1) as f32 {
             return None;
         }

@@ -106,6 +106,10 @@ pub enum Command {
         /// Keep the lens exactly as given: do not calibrate field of view and distortion.
         #[arg(long)]
         no_lens_optimization: bool,
+        /// Never use the learned matcher for photos ordinary matching cannot connect (it downloads
+        /// its 65 MB of models the first time it is needed).
+        #[arg(long)]
+        no_learned: bool,
         /// Do not level the horizon.
         #[arg(long)]
         no_level: bool,
@@ -129,6 +133,13 @@ pub enum Command {
         /// Width of the stitched panorama.
         #[arg(long, default_value_t = 8000)]
         width: u32,
+        /// Run the accuracy suite instead: lens families the solver is not told, a low-texture
+        /// sphere and a partial panorama, scored by true misregistration against ground truth.
+        #[arg(long)]
+        suite: bool,
+        /// With --suite: also write the results as JSON.
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
 }
 
@@ -218,6 +229,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             no_exposure,
             no_local,
             no_lens_optimization,
+            no_learned,
             no_level,
             no_trim,
             project,
@@ -226,7 +238,10 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
         } => {
             use nodal_stitch::{features::DetectOptions, project::PoleFill, AlignOptions, LensKind, RenderOptions};
             let ext = out.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            anyhow::ensure!(matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "tif" | "tiff"), "output must be a .jpg, .png or .tif file");
+            anyhow::ensure!(
+                matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "tif" | "tiff" | "psd" | "psb"),
+                "output must be a .jpg (8-bit), .tif, .png or .psd (16-bit) file"
+            );
             let lens = match (lens.as_deref(), hfov) {
                 (None, None) => None,
                 (kind, fov) => {
@@ -252,7 +267,15 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             };
             let sources = nodal_stitch::load_sources(&images, &DetectOptions::default(), &|f, s| show(f * 0.25, s))?;
             let t_load = t0.elapsed();
-            let align_opts = AlignOptions { lens, optimize_lens: !no_lens_optimization, level: !no_level, ..Default::default() };
+            #[allow(unused_mut)]
+            let mut align_opts = AlignOptions { lens, optimize_lens: !no_lens_optimization, level: !no_level, ..Default::default() };
+            #[cfg(feature = "ml")]
+            if !no_learned {
+                align_opts.rescue =
+                    Some(nodal_stitch::align::RescueHandle(std::sync::Arc::new(nodal_stitch::ml::SourceRescue::new(&sources))));
+            }
+            #[cfg(not(feature = "ml"))]
+            let _ = no_learned;
             let (mut proj, report) = nodal_stitch::align_sources(&sources, &align_opts, &|f, s| show(0.25 + f * 0.25, s))?;
             let t_align = t0.elapsed();
             proj.output.width = width.unwrap_or(0);
@@ -263,8 +286,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             proj.output.pole_fill = if no_fill { PoleFill::Off } else { PoleFill::Auto };
             proj.output.nadir_patch = nadir_patch;
             proj.output.zenith_patch = zenith_patch;
-            let pixels: Vec<_> = sources.iter().map(|s| s.image.clone()).collect();
-            let pano = nodal_stitch::render(&proj, &pixels, &RenderOptions::default(), &|f, s| show(0.5 + f * 0.5, s))?;
+            let pano = nodal_stitch::render(&proj, &sources, &RenderOptions::default(), &|f, s| show(0.5 + f * 0.5, s))?;
             end_line();
             nodal_stitch::io::save_panorama(&pano, &out, quality)?;
 
@@ -274,7 +296,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                 let n = proj.images.iter().filter(|img| img.lens == i).count();
                 println!(
                     "  lens: {} {:.1}° ({:.0} mm equiv.), distortion a {:+.4} b {:+.4} c {:+.4}  [{n} photos]",
-                    l.kind.label().to_lowercase(),
+                    l.projection_label().to_lowercase(),
                     l.hfov,
                     l.focal_35mm(),
                     l.a,
@@ -289,8 +311,27 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                 report.rms,
                 report.max
             );
+            let learned = report.pairs.iter().filter(|p| p.learned).count();
+            if learned > 0 {
+                println!("  learned matcher: connected {learned} pairs ordinary matching could not");
+            }
+            for line in report.log.iter().filter(|l| l.starts_with("Learned matching unavailable")) {
+                println!("  {line}");
+            }
             if let Some(local) = report.local.filter(|l| l.images_warped > 0) {
                 println!("  local alignment: RMS {:.2} → {:.2} px", local.before, local.after);
+            }
+            if let Some(d) = &report.dense {
+                println!(
+                    "  dense registration: {} pairs, misregistration median {:.2} px, 90 % under {:.2} px{}",
+                    d.pairs,
+                    if d.images_warped > 0 { d.median_warped } else { d.median_after },
+                    if d.images_warped > 0 { d.p90_warped } else { d.p90_after },
+                    if d.images_warped > 0 { format!(" (local warps on {} photos)", d.images_warped) } else { String::new() }
+                );
+            }
+            if let Some(ph) = &report.photometric {
+                println!("  {}", ph.summary().to_lowercase());
             }
             let (hf, vf, _) = pano.coverage_degrees();
             if pano.is_full_sphere() {
@@ -311,6 +352,10 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                     "  note: the panorama has uncovered areas{}",
                     if ext == "jpg" || ext == "jpeg" { " (black in JPEG; use .png or .tif to keep them transparent)" } else { "" }
                 );
+            }
+            if !report.estimated.is_empty() {
+                let names: Vec<&str> = report.estimated.iter().map(|&i| proj.images[i].name.as_str()).collect();
+                println!("  placed from the shooting pattern (nothing to match, e.g. clear sky): {}", names.join(", "));
             }
             for i in &report.unaligned {
                 println!("  warning: {} does not overlap the others enough and was left out", proj.images[*i].name);
@@ -338,7 +383,13 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                 println!("  tour with {} scene(s) → {}", t.scenes.len(), dir.join("tour.json").display());
             }
         }
-        Command::Bench { megapixels, width } => bench(megapixels, width)?,
+        Command::Bench { megapixels, width, suite, json } => {
+            if suite {
+                bench_suite(if megapixels == 12.0 { 4.0 } else { megapixels }, json)?
+            } else {
+                bench(megapixels, width)?
+            }
+        }
         Command::Render { tour, scene, yaw, pitch, fov, projection, size, out } => {
             let json = tour_json(&tour);
             let t = Tour::from_json(&std::fs::read_to_string(&json)?)?;
@@ -412,8 +463,71 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
 }
 
 /// Stitches a synthetic photo set with known ground truth and reports timings and accuracy.
+/// Accuracy suite: true misregistration against ground truth on synthetic sets.
+fn bench_suite(megapixels: f32, json: Option<PathBuf>) -> anyhow::Result<()> {
+    use nodal_stitch::bench::{run_case, standard_suite};
+    anyhow::ensure!((0.3..=24.0).contains(&megapixels), "--megapixels must be between 0.3 and 24 for the suite");
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    println!("Nodal {} accuracy suite ({} {}, {cores} cores)", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    println!("True misregistration: how far apart the solved model puts the same scene point in two photos (source px).");
+    #[cfg(feature = "ml")]
+    let make = |s: &[nodal_stitch::Source]| nodal_stitch::align::RescueHandle(std::sync::Arc::new(nodal_stitch::ml::SourceRescue::new(s)));
+    #[cfg(feature = "ml")]
+    let rescue: Option<nodal_stitch::bench::RescueFactory> = Some(&make);
+    #[cfg(not(feature = "ml"))]
+    let rescue: Option<nodal_stitch::bench::RescueFactory> = None;
+    let show = progress_printer();
+    let mut results = Vec::new();
+    for case in standard_suite(megapixels as f64) {
+        let r = run_case(&case, rescue, &|f, s| show(f, s))?;
+        if std::io::stderr().is_terminal() {
+            eprintln!();
+        }
+        results.push(r);
+    }
+    println!();
+    println!(
+        "{:<22} {:>7} {:>8} {:>8} {:>8} {:>9} {:>8}  lens found (truth)",
+        "set", "placed", "median", "p95", "max", "edge p95", "align s"
+    );
+    for r in &results {
+        let placed =
+            if r.estimated > 0 { format!("{}+{}/{}", r.placed, r.estimated, r.photos) } else { format!("{}/{}", r.placed, r.photos) };
+        println!(
+            "{:<22} {:>7} {:>8.3} {:>8.3} {:>8.2} {:>9.3} {:>8.1}  {} ({}){}",
+            r.name,
+            placed,
+            r.all.1,
+            r.all.2,
+            r.all.3,
+            r.edges.2,
+            r.align_seconds,
+            r.lens,
+            r.true_lens,
+            if r.learned_pairs > 0 { format!(", {} pairs by the learned matcher", r.learned_pairs) } else { String::new() }
+        );
+    }
+    if let Some(path) = json {
+        let rows: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "set": r.name, "description": r.description, "photos": r.photos, "placed": r.placed,
+                    "estimated": r.estimated, "learned_pairs": r.learned_pairs, "align_seconds": r.align_seconds,
+                    "misregistration_px": { "rms": r.all.0, "median": r.all.1, "p95": r.all.2, "max": r.all.3 },
+                    "edge_misregistration_px": { "rms": r.edges.0, "median": r.edges.1, "p95": r.edges.2, "max": r.edges.3 },
+                    "lens": r.lens, "true_lens": r.true_lens,
+                })
+            })
+            .collect();
+        std::fs::write(&path, serde_json::to_string_pretty(&rows)?)?;
+        println!("results written to {}", path.display());
+    }
+    Ok(())
+}
+
 fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
-    use nodal_stitch::features::{detect, DetectOptions};
+    use nodal_stitch::features::DetectOptions;
     use nodal_stitch::project::{rotation_from_ypr, PoleFill};
     use nodal_stitch::synth::{procedural_pano, render_shot, ShotOptions};
     use nodal_stitch::{AlignOptions, Lens, LensKind, RenderOptions, Source};
@@ -465,12 +579,7 @@ fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
     let sources: Vec<Source> = shots
         .par_iter()
         .enumerate()
-        .map(|(i, s)| Source {
-            path: format!("bench{i}.jpg").into(),
-            image: s.clone(),
-            exif: Default::default(),
-            features: Arc::new(detect(s.as_raw(), s.width() as usize, s.height() as usize, &DetectOptions::default())),
-        })
+        .map(|(i, s)| Source::from_rgb8(format!("bench{i}.jpg"), s.clone(), Default::default(), &DetectOptions::default()))
         .collect();
     let t_features = t0.elapsed().as_secs_f32();
 
@@ -483,7 +592,7 @@ fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
     proj.output.pole_fill = PoleFill::Auto;
     proj.output.nadir_patch = 20.0; // exercise the pole patcher too
     let t = Instant::now();
-    let pano = nodal_stitch::render(&proj, &shots, &RenderOptions::default(), &|_, _| {})?;
+    let pano = nodal_stitch::render(&proj, &sources, &RenderOptions::default(), &|_, _| {})?;
     let t_render = t.elapsed().as_secs_f32();
 
     let total_mp = poses.len() as f32 * (sw * sh) as f32 / 1e6;
@@ -505,7 +614,7 @@ fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
     println!("  total:               {:6.2} s", t_features + t_align + t_render);
     println!(
         "  accuracy: lens {} {:.2}° (true: fisheye {true_fov:.2}°), {} photos aligned",
-        est.kind.label().to_lowercase(),
+        est.projection_label().to_lowercase(),
         est.hfov,
         proj.images.iter().filter(|i| i.aligned).count()
     );

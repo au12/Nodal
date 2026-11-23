@@ -73,7 +73,7 @@ fn psnr(scene: &Scene, pano: &nodal_stitch::Panorama) -> (f64, f64) {
             let gy = fy * gh as f32 / pano.full_height as f32;
             let t = sample_bicubic(scene.pano.as_raw(), gw, gh, gx, gy, true);
             for (c, tc) in t.iter().enumerate() {
-                let d = pano.rgb[o * 3 + c] as f64 - *tc as f64;
+                let d = pano.rgb[o * 3 + c] as f64 / 257.0 - *tc as f64;
                 se += d * d;
             }
             n += 3;
@@ -98,6 +98,29 @@ fn fisheye_sphere_matches_ground_truth() {
     let (db, covered) = psnr(&scene, &pano);
     assert!(covered > 0.999, "coverage {covered}");
     assert!(db > 27.0, "PSNR {db:.1} dB");
+}
+
+#[test]
+fn equisolid_fisheye_projection_is_recovered() {
+    // Most real fisheyes are equisolid, not equidistant; the solver must find that by itself.
+    let mut lens = Lens::new(LensKind::FisheyeEquisolid, 110.0, 640, 960);
+    lens.b = -0.02;
+    let poses = [
+        (0.0, 2.0, 1.0),
+        (61.0, -1.0, -2.0),
+        (119.0, 3.0, 0.5),
+        (182.0, 0.0, 1.5),
+        (240.0, -2.0, -1.0),
+        (301.0, 1.0, 0.0),
+        (10.0, 88.0, 0.0),
+        (30.0, -86.0, 5.0),
+    ];
+    let scene = build(lens, &poses, false, false);
+    let est = scene.project.lenses[0];
+    assert!((est.k() + 0.5).abs() < 0.2, "projection factor {:.2} (equisolid is -0.5)", est.k());
+    // One source pixel is about 0.17° at the centre of these small frames.
+    let err = orientation_error_deg(&scene);
+    assert!(err < 0.3, "orientation error {err:.3}°");
 }
 
 #[test]
@@ -145,24 +168,14 @@ fn pole_gaps_are_filled_seamlessly() {
             rgb[y * w * 3..(y + 1) * w * 3].fill(0);
         }
     }
-    let mut pano = nodal_stitch::Panorama {
-        width: w,
-        height: h,
-        rgb,
-        alpha,
-        full_width: w,
-        full_height: h,
-        crop_x: 0,
-        crop_y: 0,
-        stats: Default::default(),
-    };
+    let mut pano = nodal_stitch::Panorama::from_rgb8(w, h, &rgb, alpha);
     assert!((pole_gap(&pano, true, 62.0).unwrap() - zenith).abs() < 1.0);
     let report = fill_poles(&mut pano, &FillOptions::default(), &|_, _| {});
     assert!(report.zenith.is_some() && report.nadir.is_some(), "{report:?}");
     assert!(!pano.has_gaps(), "every pixel must be filled");
     // Untouched outside the patched caps (a few degrees of cross-fade allowed).
     for y in (h * 30 / 180)..(h * 145 / 180) {
-        assert_eq!(&pano.rgb[y * w * 3..(y + 1) * w * 3], &truth.as_raw()[y * w * 3..(y + 1) * w * 3], "row {y} changed");
+        assert_eq!(&pano.rgb8()[y * w * 3..(y + 1) * w * 3], &truth.as_raw()[y * w * 3..(y + 1) * w * 3], "row {y} changed");
     }
     // The patch has the same overall tone and texture strength as the material around it.
     let stats = |img: &[u8], y0: usize, y1: usize| {
@@ -172,7 +185,7 @@ fn pole_gaps_are_filled_seamlessly() {
         (mean, var.sqrt())
     };
     for (y0, y1) in [(0, h * 16 / 180), (h * 156 / 180, h)] {
-        let (m_fill, s_fill) = stats(&pano.rgb, y0, y1);
+        let (m_fill, s_fill) = stats(&pano.rgb8(), y0, y1);
         let (m_true, s_true) = stats(truth.as_raw(), y0, y1);
         // The hidden cap can only be guessed, so this is a sanity bound, not an accuracy claim.
         assert!((m_fill - m_true).abs() < 35.0, "tone {m_fill:.1} vs {m_true:.1}");

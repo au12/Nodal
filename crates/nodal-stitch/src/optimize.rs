@@ -13,13 +13,16 @@ pub struct LensFlags {
     pub b: bool,
     pub c: bool,
     pub shift: bool,
+    /// Projection factor k (fisheye lenses only: rectilinear stays at k = 1, its distortion is the
+    /// polynomial's job). Moves at constant focal length.
+    pub k: bool,
 }
 
 impl LensFlags {
-    pub const NONE: LensFlags = LensFlags { fov: false, a: false, b: false, c: false, shift: false };
+    pub const NONE: LensFlags = LensFlags { fov: false, a: false, b: false, c: false, shift: false, k: false };
 
-    fn list(&self) -> [bool; 6] {
-        [self.fov, self.a, self.b, self.c, self.shift, self.shift]
+    fn list(&self) -> [bool; N_LENS] {
+        [self.fov, self.a, self.b, self.c, self.shift, self.shift, self.k]
     }
 }
 
@@ -44,9 +47,17 @@ pub struct OptReport {
     pub cost: f64,
 }
 
-const N_LENS: usize = 6;
+const N_LENS: usize = 7;
 const EPS_ROT: f64 = 1e-6;
-const EPS_LENS: [f64; N_LENS] = [1e-4, 1e-6, 1e-6, 1e-6, 1e-3, 1e-3];
+const EPS_LENS: [f64; N_LENS] = [1e-4, 1e-6, 1e-6, 1e-6, 1e-3, 1e-3, 1e-5];
+
+/// Changes the projection factor while keeping the focal length (so k and the field of view stay
+/// nearly independent parameters).
+fn set_k(l: &mut Lens, k: f64) {
+    let f = l.focal_px();
+    l.k = Some(k.clamp(-0.95, 0.85));
+    l.set_focal_px(f);
+}
 
 fn lens_get(l: &Lens, k: usize) -> f64 {
     match k {
@@ -55,7 +66,8 @@ fn lens_get(l: &Lens, k: usize) -> f64 {
         2 => l.b,
         3 => l.c,
         4 => l.d,
-        _ => l.e,
+        5 => l.e,
+        _ => l.k(),
     }
 }
 
@@ -66,7 +78,8 @@ fn lens_add(l: &mut Lens, k: usize, v: f64) {
         2 => l.b = (l.b + v).clamp(-0.8, 0.8),
         3 => l.c = (l.c + v).clamp(-0.6, 0.6),
         4 => l.d += v,
-        _ => l.e += v,
+        5 => l.e += v,
+        _ => set_k(l, l.k() + v),
     }
 }
 
@@ -160,6 +173,8 @@ fn prior_terms(state: &State, opts: &OptOptions, prior_w: f64) -> Vec<(usize, us
         for k in [4usize, 5] {
             out.push((li, k, prior_w * lens_get(l, k) / shift_sigma, prior_w / shift_sigma));
         }
+        // The projection factor drifts only as far as the data asks.
+        out.push((li, 6, prior_w * (l.k() - l.kind.default_k()) / 2.0, prior_w / 2.0));
     }
     out
 }
@@ -196,7 +211,7 @@ pub fn optimize(project: &mut Project, cps: &[ControlPoint], opts: &OptOptions) 
             continue;
         }
         for k in 0..N_LENS {
-            if flags[k] {
+            if flags[k] && (k != 6 || state.lenses[li].is_fisheye()) {
                 layout.lens[li][k] = Some(layout.n);
                 layout.n += 1;
             }
@@ -239,7 +254,8 @@ pub fn optimize(project: &mut Project, cps: &[ControlPoint], opts: &OptOptions) 
                         2 => lp.b += EPS_LENS[2],
                         3 => lp.c += EPS_LENS[3],
                         4 => lp.d += EPS_LENS[4],
-                        _ => lp.e += EPS_LENS[5],
+                        5 => lp.e += EPS_LENS[5],
+                        _ => set_k(&mut lp, l.k() + EPS_LENS[6]),
                     }
                     *m = lp.model();
                 }

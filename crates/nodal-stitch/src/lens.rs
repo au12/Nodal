@@ -41,36 +41,86 @@ impl LensKind {
         }
     }
 
-    /// Ideal radius (in focal lengths) at angle `theta` from the optical axis.
-    #[inline]
-    fn g(self, theta: f64) -> f64 {
+    /// The projection factor `k` of this family (see [`projection`]): 1 rectilinear, 0.5
+    /// stereographic, 0 equidistant, −0.5 equisolid.
+    pub fn default_k(self) -> f64 {
         match self {
-            LensKind::Rectilinear => theta.tan(),
-            LensKind::Fisheye => theta,
-            LensKind::FisheyeEquisolid => 2.0 * (theta * 0.5).sin(),
-            LensKind::FisheyeStereographic => 2.0 * (theta * 0.5).tan(),
+            LensKind::Rectilinear => 1.0,
+            LensKind::Fisheye => 0.0,
+            LensKind::FisheyeEquisolid => -0.5,
+            LensKind::FisheyeStereographic => 0.5,
         }
+    }
+
+    /// The named family closest to a projection factor.
+    pub fn nearest(k: f64) -> LensKind {
+        [LensKind::Rectilinear, LensKind::FisheyeStereographic, LensKind::Fisheye, LensKind::FisheyeEquisolid]
+            .into_iter()
+            .min_by(|a, b| (a.default_k() - k).abs().total_cmp(&(b.default_k() - k).abs()))
+            .unwrap()
     }
 
     #[inline]
     fn g_inv(self, r: f64) -> f64 {
-        match self {
-            LensKind::Rectilinear => r.atan(),
-            LensKind::Fisheye => r,
-            LensKind::FisheyeEquisolid => 2.0 * (r * 0.5).clamp(-1.0, 1.0).asin(),
-            LensKind::FisheyeStereographic => 2.0 * (r * 0.5).atan(),
-        }
+        projection::g_inv(self.default_k(), r)
     }
 
     /// Largest usable angle from the optical axis.
     #[inline]
     pub fn max_theta(self) -> f64 {
-        match self {
-            LensKind::Rectilinear => 88.0f64.to_radians(),
-            LensKind::Fisheye => 170.0f64.to_radians(),
-            LensKind::FisheyeEquisolid => 175.0f64.to_radians(),
-            LensKind::FisheyeStereographic => 160.0f64.to_radians(),
+        projection::max_theta(self.default_k())
+    }
+}
+
+/// One-parameter family of ideal lens projections (PTGui's "fisheye factor"):
+/// `r = f·tan(kθ)/k` for k > 0, `r = f·θ` at k = 0 and `r = f·sin(kθ)/k` for k < 0. k = 1 is
+/// rectilinear, 0.5 stereographic, 0 equidistant, −0.5 equisolid and −1 orthographic, and every
+/// value in between is a valid lens, so the solver can fit the projection instead of guessing a
+/// family.
+pub mod projection {
+    /// Ideal radius in focal lengths at angle `theta` from the axis.
+    #[inline]
+    pub fn g(k: f64, theta: f64) -> f64 {
+        if k.abs() < 1e-6 {
+            theta
+        } else if k > 0.0 {
+            (k * theta).tan() / k
+        } else {
+            (k * theta).sin() / k
         }
+    }
+
+    /// Angle from the axis for an ideal radius in focal lengths.
+    #[inline]
+    pub fn g_inv(k: f64, r: f64) -> f64 {
+        if k.abs() < 1e-6 {
+            r
+        } else if k > 0.0 {
+            (k * r).atan() / k
+        } else {
+            (k * r).clamp(-1.0, 1.0).asin() / k
+        }
+    }
+
+    /// Derivative dg/dθ.
+    #[inline]
+    pub fn dg(k: f64, theta: f64) -> f64 {
+        if k.abs() < 1e-6 {
+            1.0
+        } else if k > 0.0 {
+            let c = (k * theta).cos();
+            1.0 / (c * c)
+        } else {
+            (k * theta).cos()
+        }
+    }
+
+    /// Largest usable angle: where the projection stops growing (or 175°).
+    #[inline]
+    pub fn max_theta(k: f64) -> f64 {
+        let lim = if k.abs() < 1e-6 { f64::INFINITY } else { std::f64::consts::FRAC_PI_2 / k.abs() };
+        // Rectilinear: 88°. Shrink a little below the asymptote everywhere.
+        (lim - 2.0f64.to_radians() * k.abs().min(1.0)).min(175.0f64.to_radians())
     }
 }
 
@@ -94,11 +144,35 @@ pub struct Lens {
     /// Image size this lens describes, in pixels (EXIF orientation applied).
     pub width: u32,
     pub height: u32,
+    /// Fitted projection factor (see [`projection`]); `None` uses the family's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k: Option<f64>,
+    /// Vignetting: relative illumination `1 + v₁r² + v₂r⁴ + v₃r⁶`, with `r` the distance from the
+    /// principal point over half the image diagonal.
+    #[serde(default, skip_serializing_if = "is_zero3")]
+    pub vignette: [f64; 3],
+}
+
+fn is_zero3(v: &[f64; 3]) -> bool {
+    v.iter().all(|x| *x == 0.0)
 }
 
 impl Lens {
     pub fn new(kind: LensKind, hfov: f64, width: u32, height: u32) -> Self {
-        Lens { kind, hfov, a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, width, height }
+        Lens { kind, hfov, a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, width, height, k: None, vignette: [0.0; 3] }
+    }
+
+    /// Projection factor in use.
+    pub fn k(&self) -> f64 {
+        self.k.unwrap_or_else(|| self.kind.default_k())
+    }
+
+    /// Relative illumination at a pixel (1 at the centre).
+    #[inline]
+    pub fn vignetting_at(&self, x: f64, y: f64) -> f64 {
+        let (w, h) = (self.width as f64, self.height as f64);
+        let r2 = ((x - w * 0.5 - self.d).powi(2) + (y - h * 0.5 - self.e).powi(2)) / ((w * w + h * h) * 0.25);
+        1.0 + r2 * (self.vignette[0] + r2 * (self.vignette[1] + r2 * self.vignette[2]))
     }
 
     /// Precomputes everything needed for fast projection.
@@ -108,8 +182,15 @@ impl Lens {
 
     /// Focal length in pixels.
     pub fn focal_px(&self) -> f64 {
-        let half = (self.hfov.to_radians() * 0.5).min(self.kind.max_theta());
-        self.width as f64 * 0.5 / self.kind.g(half)
+        let k = self.k();
+        let half = (self.hfov.to_radians() * 0.5).min(projection::max_theta(k));
+        self.width as f64 * 0.5 / projection::g(k, half)
+    }
+
+    /// Sets the field of view so the focal length becomes `f_px`.
+    pub fn set_focal_px(&mut self, f_px: f64) {
+        let k = self.k();
+        self.hfov = (2.0 * projection::g_inv(k, self.width as f64 * 0.5 / f_px)).to_degrees();
     }
 
     /// 35 mm-equivalent focal length (by image diagonal), for display.
@@ -126,10 +207,23 @@ impl Lens {
         (2.0 * half).to_degrees()
     }
 
+    /// Whether the projection is a fisheye (anything well below rectilinear).
+    pub fn is_fisheye(&self) -> bool {
+        self.k() < 0.9
+    }
+
     /// Field of view across the image diagonal in degrees (ideal projection).
     pub fn diagonal_fov(&self) -> f64 {
         let diag = ((self.width as f64).powi(2) + (self.height as f64).powi(2)).sqrt();
-        (2.0 * self.kind.g_inv(diag * 0.5 / self.focal_px())).to_degrees()
+        (2.0 * projection::g_inv(self.k(), diag * 0.5 / self.focal_px()).min(projection::max_theta(self.k()))).to_degrees()
+    }
+
+    /// Display name of the projection: the family, or "k = …" for a fitted in-between value.
+    pub fn projection_label(&self) -> String {
+        match self.k {
+            Some(k) if (k - self.kind.default_k()).abs() > 0.02 => format!("{} (k = {k:.2})", LensKind::nearest(k).label()),
+            _ => self.kind.label().to_string(),
+        }
     }
 }
 
@@ -137,6 +231,8 @@ impl Lens {
 #[derive(Clone, Copy, Debug)]
 pub struct LensModel {
     pub kind: LensKind,
+    /// Projection factor.
+    pub k: f64,
     pub f: f64,
     pub cx: f64,
     pub cy: f64,
@@ -186,6 +282,7 @@ impl LensModel {
         }
         LensModel {
             kind: l.kind,
+            k: l.k(),
             f: l.focal_px(),
             cx: w * 0.5 + l.d,
             cy: h * 0.5 + l.e,
@@ -195,7 +292,7 @@ impl LensModel {
             c: l.c,
             d0,
             rho_max,
-            theta_max: l.kind.max_theta(),
+            theta_max: projection::max_theta(l.k()),
             w,
             h,
         }
@@ -213,7 +310,7 @@ impl LensModel {
         if rxy < 1e-12 {
             return Some((self.cx, self.cy));
         }
-        let rho = self.f * self.kind.g(theta) / self.r0;
+        let rho = self.f * projection::g(self.k, theta) / self.r0;
         if rho > self.rho_max {
             return None;
         }
@@ -250,7 +347,7 @@ impl LensModel {
             }
             rho = rho.clamp(0.0, self.rho_max.min(1e6));
         }
-        let theta = self.kind.g_inv(rho * self.r0 / self.f).min(self.theta_max);
+        let theta = projection::g_inv(self.k, rho * self.r0 / self.f).min(self.theta_max);
         let (st, ct) = theta.sin_cos();
         V3::new(st * dx / r_src, -st * dy / r_src, ct)
     }
@@ -258,6 +355,12 @@ impl LensModel {
     #[inline]
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= 0.0 && y >= 0.0 && x <= self.w && y <= self.h
+    }
+
+    /// Whether the projection is a fisheye.
+    #[inline]
+    pub fn is_fisheye(&self) -> bool {
+        self.k < 0.9
     }
 
     /// Angular size of one pixel at the image centre, in radians.
