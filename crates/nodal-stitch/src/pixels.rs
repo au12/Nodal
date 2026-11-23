@@ -56,7 +56,7 @@ impl LinearImage {
 
     pub fn scale(&mut self, k: [f32; 3]) {
         self.data.par_chunks_mut(3 * 1024).for_each(|c| {
-            for p in c.chunks_exact_mut(3) {
+            for p in c.as_chunks_mut::<3>().0 {
                 p[0] *= k[0];
                 p[1] *= k[1];
                 p[2] *= k[2];
@@ -135,7 +135,7 @@ impl LinearImage {
         let n = self.len_pixels().max(1) as f64;
         let s = self.data.par_chunks(3 * 4096).map(|c| {
             let mut s = [0.0f64; 3];
-            for p in c.chunks_exact(3) {
+            for p in c.as_chunks::<3>().0 {
                 s[0] += p[0] as f64;
                 s[1] += p[1] as f64;
                 s[2] += p[2] as f64;

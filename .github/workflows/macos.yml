@@ -24,7 +24,8 @@ jobs:
     name: Nodal.app (Apple Silicon)
     runs-on: macos-latest
     env:
-      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # ONNX Runtime's prebuilt library (learned matcher) is built for macOS 13.4.
+      MACOSX_DEPLOYMENT_TARGET: "13.4"
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4

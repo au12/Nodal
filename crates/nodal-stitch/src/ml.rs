@@ -197,7 +197,7 @@ impl LearnedMatcher {
             out
         };
         let mut chw = vec![0.0f32; 3 * mw * mh];
-        for (i, p) in small.chunks_exact(3).enumerate() {
+        for (i, p) in small.as_chunks::<3>().0.iter().enumerate() {
             chw[i] = p[0];
             chw[mw * mh + i] = p[1];
             chw[2 * mw * mh + i] = p[2];
@@ -210,7 +210,7 @@ impl LearnedMatcher {
         let (_, de) = out["descriptors"].try_extract_tensor::<f32>()?;
         anyhow::ensure!(kp.len() == K * 2 && nk.len() == K * 2 && de.len() == K * DESC, "unexpected extractor output");
         let (sx, sy) = (w as f32 / mw as f32, h as f32 / mh as f32);
-        let kp: Vec<[f32; 2]> = kp.chunks_exact(2).map(|p| [(p[0] + 0.5) * sx - 0.5, (p[1] + 0.5) * sy - 0.5]).collect();
+        let kp: Vec<[f32; 2]> = kp.as_chunks::<2>().0.iter().map(|p| [(p[0] + 0.5) * sx - 0.5, (p[1] + 0.5) * sy - 0.5]).collect();
         let px = 0.5 * (sx + sy);
         let contrast = local_contrast(img, &kp, (3.0 * px).round().max(3.0) as i64);
         Ok(LearnedFeatures { kp, norm: nk.to_vec(), desc: de.to_vec(), px, contrast })
@@ -248,7 +248,7 @@ pub fn mutual_matches(a: &LearnedFeatures, b: &LearnedFeatures) -> Vec<(u16, u16
     let sim = &da * db.transpose();
     let mut row_best = vec![(f32::MIN, f32::MIN, 0usize); K];
     let mut col_best = vec![0usize; K];
-    for (j, col) in sim.as_slice().chunks_exact(K).enumerate() {
+    for (j, col) in sim.as_slice().as_chunks::<K>().0.iter().enumerate() {
         let mut best = (f32::MIN, 0usize);
         for (i, &s) in col.iter().enumerate() {
             if s > best.0 {

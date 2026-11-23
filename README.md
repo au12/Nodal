@@ -40,7 +40,7 @@ Nodal covers the whole panorama workflow in one app:
 
 ## Install
 
-### 🍎 macOS (Apple Silicon)
+### 🍎 macOS (Apple Silicon, macOS 13.4 or later)
 
 1. Download **`Nodal-<version>-macos-arm64.dmg`** from the [latest release](https://github.com/au12/Nodal/releases/latest).
    For the newest build from `main`, open the most recent
@@ -48,7 +48,7 @@ Nodal covers the whole panorama workflow in one app:
 2. Open the disk image and drag **Nodal** to **Applications**.
 3. First launch: CI builds are ad-hoc signed unless a Developer ID is configured (see [CI](#ci--releases)), so Gatekeeper asks once.
    - **macOS 15 and later:** open Nodal, choose **Done**, then go to **System Settings → Privacy & Security** and click **Open Anyway**.
-   - **macOS 11–14:** right-click **Nodal** in Applications and choose **Open**.
+   - **macOS 13.4–14:** right-click **Nodal** in Applications and choose **Open**.
    - Or from Terminal: `xattr -dr com.apple.quarantine /Applications/Nodal.app`
 
 The app bundle also contains the command-line tools: `/Applications/Nodal.app/Contents/MacOS/nodal --help`.
