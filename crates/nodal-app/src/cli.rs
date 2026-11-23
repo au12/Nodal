@@ -133,6 +133,13 @@ pub enum Command {
         /// Width of the stitched panorama.
         #[arg(long, default_value_t = 8000)]
         width: u32,
+        /// Run the accuracy suite instead: lens families the solver is not told, a low-texture
+        /// sphere and a partial panorama, scored by true misregistration against ground truth.
+        #[arg(long)]
+        suite: bool,
+        /// With --suite: also write the results as JSON.
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
 }
 
@@ -376,7 +383,13 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                 println!("  tour with {} scene(s) → {}", t.scenes.len(), dir.join("tour.json").display());
             }
         }
-        Command::Bench { megapixels, width } => bench(megapixels, width)?,
+        Command::Bench { megapixels, width, suite, json } => {
+            if suite {
+                bench_suite(if megapixels == 12.0 { 4.0 } else { megapixels }, json)?
+            } else {
+                bench(megapixels, width)?
+            }
+        }
         Command::Render { tour, scene, yaw, pitch, fov, projection, size, out } => {
             let json = tour_json(&tour);
             let t = Tour::from_json(&std::fs::read_to_string(&json)?)?;
@@ -450,6 +463,69 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
 }
 
 /// Stitches a synthetic photo set with known ground truth and reports timings and accuracy.
+/// Accuracy suite: true misregistration against ground truth on synthetic sets.
+fn bench_suite(megapixels: f32, json: Option<PathBuf>) -> anyhow::Result<()> {
+    use nodal_stitch::bench::{run_case, standard_suite};
+    anyhow::ensure!((0.3..=24.0).contains(&megapixels), "--megapixels must be between 0.3 and 24 for the suite");
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    println!("Nodal {} accuracy suite ({} {}, {cores} cores)", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    println!("True misregistration: how far apart the solved model puts the same scene point in two photos (source px).");
+    #[cfg(feature = "ml")]
+    let make = |s: &[nodal_stitch::Source]| nodal_stitch::align::RescueHandle(std::sync::Arc::new(nodal_stitch::ml::SourceRescue::new(s)));
+    #[cfg(feature = "ml")]
+    let rescue: Option<nodal_stitch::bench::RescueFactory> = Some(&make);
+    #[cfg(not(feature = "ml"))]
+    let rescue: Option<nodal_stitch::bench::RescueFactory> = None;
+    let show = progress_printer();
+    let mut results = Vec::new();
+    for case in standard_suite(megapixels as f64) {
+        let r = run_case(&case, rescue, &|f, s| show(f, s))?;
+        if std::io::stderr().is_terminal() {
+            eprintln!();
+        }
+        results.push(r);
+    }
+    println!();
+    println!(
+        "{:<22} {:>7} {:>8} {:>8} {:>8} {:>9} {:>8}  lens found (truth)",
+        "set", "placed", "median", "p95", "max", "edge p95", "align s"
+    );
+    for r in &results {
+        let placed =
+            if r.estimated > 0 { format!("{}+{}/{}", r.placed, r.estimated, r.photos) } else { format!("{}/{}", r.placed, r.photos) };
+        println!(
+            "{:<22} {:>7} {:>8.3} {:>8.3} {:>8.2} {:>9.3} {:>8.1}  {} ({}){}",
+            r.name,
+            placed,
+            r.all.1,
+            r.all.2,
+            r.all.3,
+            r.edges.2,
+            r.align_seconds,
+            r.lens,
+            r.true_lens,
+            if r.learned_pairs > 0 { format!(", {} pairs by the learned matcher", r.learned_pairs) } else { String::new() }
+        );
+    }
+    if let Some(path) = json {
+        let rows: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "set": r.name, "description": r.description, "photos": r.photos, "placed": r.placed,
+                    "estimated": r.estimated, "learned_pairs": r.learned_pairs, "align_seconds": r.align_seconds,
+                    "misregistration_px": { "rms": r.all.0, "median": r.all.1, "p95": r.all.2, "max": r.all.3 },
+                    "edge_misregistration_px": { "rms": r.edges.0, "median": r.edges.1, "p95": r.edges.2, "max": r.edges.3 },
+                    "lens": r.lens, "true_lens": r.true_lens,
+                })
+            })
+            .collect();
+        std::fs::write(&path, serde_json::to_string_pretty(&rows)?)?;
+        println!("results written to {}", path.display());
+    }
+    Ok(())
+}
+
 fn bench(megapixels: f32, width: u32) -> anyhow::Result<()> {
     use nodal_stitch::features::DetectOptions;
     use nodal_stitch::project::{rotation_from_ypr, PoleFill};

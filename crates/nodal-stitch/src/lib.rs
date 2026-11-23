@@ -10,6 +10,7 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 pub mod align;
+pub mod bench;
 pub mod blend;
 pub mod decode;
 pub mod dense;
