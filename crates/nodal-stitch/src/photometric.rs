@@ -29,6 +29,11 @@ pub struct PhotoReport {
 }
 
 impl PhotoReport {
+    /// One line for the app: how well neighbouring photos now agree in brightness.
+    pub fn short(&self) -> String {
+        format!("{:.2} → {:.2} EV", self.rms_before, self.rms_after)
+    }
+
     pub fn summary(&self) -> String {
         let falloff = self.corner_falloff.iter().map(|f| format!("{:.2} EV", -f.max(1e-3).log2())).collect::<Vec<_>>().join(", ");
         format!(

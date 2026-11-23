@@ -1303,38 +1303,56 @@ pub fn place_by_pattern(project: &mut Project, featureless: &[bool]) -> Vec<usiz
         let len = run.len() as f64;
         for (t, &i) in run.iter().enumerate() {
             let t = (t + 1) as f64;
-            let guess = match (p, q) {
+            // Candidate poses, each with how much of its frame must be new for it to be believed:
+            // between two neighbours of one row the pattern is clear; extrapolating along a row
+            // (from either side when the run sits between two rows) needs to fill a real gap.
+            let mut guesses: Vec<((f64, f64, f64), usize)> = Vec::new();
+            match (p, q) {
                 (Some(p), Some(q)) if (p.1 - q.1).abs() < 20.0 => {
                     let total = if step > 0.0 { (q.0 - p.0).rem_euclid(360.0) } else { -(p.0 - q.0).rem_euclid(360.0) };
                     let d = total / (len + 1.0);
                     let d = if (0.4..2.5).contains(&(d / step)) { d } else { step };
                     let f = t / (len + 1.0);
-                    (p.0 + d * t, p.1 + (q.1 - p.1) * f, p.2 + wrap(q.2 - p.2) * f)
+                    guesses.push(((p.0 + d * t, p.1 + (q.1 - p.1) * f, p.2 + wrap(q.2 - p.2) * f), 8));
                 }
-                (Some(p), _) => (p.0 + step * t, p.1, p.2),
-                (None, Some(q)) => (q.0 - step * (len + 1.0 - t), q.1, q.2),
-                _ => continue,
-            };
-            let r = crate::project::rotation_from_ypr(guess.0, guess.1, guess.2);
-            // Keep it only where it fills a gap: most of the frame must be unseen by placed photos.
+                _ => {
+                    if let Some(p) = p {
+                        guesses.push(((p.0 + step * t, p.1, p.2), 20));
+                    }
+                    if let Some(q) = q {
+                        guesses.push(((q.0 - step * (len + 1.0 - t), q.1, q.2), 20));
+                    }
+                }
+            }
+            // Keep the candidate that fills the most gap.
             let m = &models[project.images[i].lens];
             const G: usize = 8;
-            let mut seen = 0;
-            for gy in 0..G {
-                for gx in 0..G {
-                    let d = r * m.pixel_to_ray((gx as f64 + 0.5) / G as f64 * m.w, (gy as f64 + 0.5) / G as f64 * m.h);
-                    let covered = (0..n).any(|j| {
-                        solid(project, j) && {
-                            let mj = &models[project.images[j].lens];
-                            mj.ray_to_pixel(project.images[j].rot().inverse() * d).is_some_and(|(x, y)| mj.contains(x, y))
-                        }
-                    });
-                    seen += covered as usize;
+            let unseen = |r: &Rotation3<f64>| {
+                let mut new = 0;
+                for gy in 0..G {
+                    for gx in 0..G {
+                        let d = r * m.pixel_to_ray((gx as f64 + 0.5) / G as f64 * m.w, (gy as f64 + 0.5) / G as f64 * m.h);
+                        let covered = (0..n).any(|j| {
+                            solid(project, j) && {
+                                let mj = &models[project.images[j].lens];
+                                mj.ray_to_pixel(project.images[j].rot().inverse() * d).is_some_and(|(x, y)| mj.contains(x, y))
+                            }
+                        });
+                        new += (!covered) as usize;
+                    }
                 }
-            }
-            if seen > G * G * 6 / 10 {
-                continue;
-            }
+                new
+            };
+            let best = guesses
+                .iter()
+                .map(|&(g, need)| {
+                    let r = crate::project::rotation_from_ypr(g.0, g.1, g.2);
+                    let new = unseen(&r);
+                    (r, new, need)
+                })
+                .filter(|&(_, new, need)| new >= need)
+                .max_by_key(|&(_, new, _)| new);
+            let Some((r, _, _)) = best else { continue };
             project.images[i].set_rot(&r);
             project.images[i].aligned = true;
             project.images[i].estimated = true;
