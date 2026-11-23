@@ -117,36 +117,6 @@ pub struct LearnedFeatures {
     pub contrast: Vec<f32>,
 }
 
-/// Share of 8×8 blocks of a photo whose luma varies by at least [`MIN_CONTRAST`]. A photo of
-/// clear sky scores near zero and is not worth running the network on.
-fn textured_share(img: &RgbImage) -> f32 {
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let raw = img.as_raw();
-    let (bw, bh) = (w / 8, h / 8);
-    if bw == 0 || bh == 0 {
-        return 0.0;
-    }
-    let mut textured = 0usize;
-    for by in 0..bh {
-        for bx in 0..bw {
-            let (mut s, mut s2) = (0.0f32, 0.0f32);
-            for y in by * 8..by * 8 + 8 {
-                for x in bx * 8..bx * 8 + 8 {
-                    let i = (y * w + x) * 3;
-                    let l = 0.299 * raw[i] as f32 + 0.587 * raw[i + 1] as f32 + 0.114 * raw[i + 2] as f32;
-                    s += l;
-                    s2 += l * l;
-                }
-            }
-            let m = s / 64.0;
-            if (s2 / 64.0 - m * m).max(0.0).sqrt() >= MIN_CONTRAST {
-                textured += 1;
-            }
-        }
-    }
-    textured as f32 / (bw * bh) as f32
-}
-
 /// Luma standard deviation in a square window around each point (8-bit levels).
 fn local_contrast(img: &RgbImage, pts: &[[f32; 2]], radius: i64) -> Vec<f32> {
     let (w, h) = (img.width() as i64, img.height() as i64);
@@ -337,7 +307,7 @@ impl SourceRescue {
     }
 
     fn is_featureless(&self, i: usize) -> bool {
-        *self.featureless[i].get_or_init(|| textured_share(&self.images[i]) < 0.02)
+        *self.featureless[i].get_or_init(|| crate::pixels::textured_share(&self.images[i], MIN_CONTRAST) < 0.02)
     }
 
     fn features(&self, m: &LearnedMatcher, images: &[usize], progress: &dyn Fn(f32)) -> Result<()> {
@@ -510,12 +480,12 @@ mod tests {
             let n = ((x * 7919 + y * 104729) % 3) as u8;
             image::Rgb([90 + (y / 8) as u8 + n, 140 + n, 220])
         });
-        assert!(textured_share(&flat) < 0.02);
+        assert!(crate::pixels::textured_share(&flat, MIN_CONTRAST) < 0.02);
         let busy = RgbImage::from_fn(320, 240, |x, y| {
             let v = if ((x / 5) + (y / 7)) % 2 == 0 { 40 } else { 200 };
             image::Rgb([v, v, v])
         });
-        assert!(textured_share(&busy) > 0.5);
+        assert!(crate::pixels::textured_share(&busy, MIN_CONTRAST) > 0.5);
         let c = local_contrast(&busy, &[[100.0, 100.0], [2.0, 2.0]], 4);
         assert!(c.iter().all(|&v| v > MIN_CONTRAST));
     }

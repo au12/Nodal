@@ -109,6 +109,10 @@ pub struct SourceImage {
     /// Whether alignment placed this image.
     #[serde(default)]
     pub aligned: bool,
+    /// Placed from the shooting pattern (capture order and its neighbours' poses) because it has
+    /// nothing to match (clear sky, a blank wall), not measured from content.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
     #[serde(default = "yes")]
     pub enabled: bool,
     /// Linear-light RGB gain from exposure and white-balance compensation.
@@ -456,6 +460,7 @@ mod tests {
     fn ypr_round_trip() {
         for &(y, p, r) in &[(0.0, 0.0, 0.0), (40.0, 10.0, 0.0), (-120.0, -35.0, 12.0), (170.0, 60.0, -80.0)] {
             let mut img = SourceImage {
+                estimated: false,
                 path: PathBuf::new(),
                 name: String::new(),
                 width: 1,
