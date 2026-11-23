@@ -1059,29 +1059,48 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
     report.log.push(format!("Orientations: {} points, RMS {:.2} px", project.control_points.len(), r.rms));
     prune(project, floor * 4.0, 4.0);
     let user_lens = opts.lens.is_some();
+    // Lens parameters are added in stages, each kept only if it predicts control points it was not
+    // fitted to (every fifth point of each pair is held out): a parameter that merely absorbs noise
+    // makes the frame edges worse, where seams live, while lowering the fitted error.
+    let mut k_on = false;
     if opts.optimize_lens {
         let per_lens = project.control_points.len() / project.lenses.len().max(1);
-        let stages: [(LensFlags, usize, &str); 4] = [
-            (LensFlags { fov: !user_lens, ..LensFlags::NONE }, 12, "field of view"),
-            (LensFlags { fov: !user_lens, b: true, ..LensFlags::NONE }, 30, "distortion b"),
-            (LensFlags { fov: !user_lens, a: true, b: true, c: true, shift: false }, 80, "distortion a, b, c"),
-            (LensFlags { fov: !user_lens, a: true, b: true, c: true, shift: true }, 150, "lens shift"),
+        let fisheye = project.lenses.iter().any(|l| l.is_fisheye());
+        let none = LensFlags::NONE;
+        let stages: [(LensFlags, usize, &str, bool); 5] = [
+            (LensFlags { fov: !user_lens, ..none }, 12, "field of view", true),
+            // PTGui's advice: fit the projection with the polynomial off, then add the polynomial.
+            (LensFlags { fov: !user_lens, k: true, ..none }, 30, "projection", fisheye && !user_lens),
+            (LensFlags { fov: !user_lens, b: true, ..none }, 30, "distortion b", true),
+            (LensFlags { fov: !user_lens, a: true, b: true, c: true, ..none }, 80, "distortion a, b, c", true),
+            (LensFlags { fov: !user_lens, a: true, b: true, c: true, shift: true, ..none }, 150, "lens shift", true),
         ];
-        for (i, (flags, need, label)) in stages.iter().enumerate() {
-            if per_lens < *need || (*flags == LensFlags::NONE) {
+        for (i, (flags, need, label, enabled)) in stages.iter().enumerate() {
+            let flags = LensFlags { k: flags.k || k_on, ..*flags };
+            if !enabled || per_lens < *need || flags == LensFlags::NONE {
                 continue;
             }
-            progress(0.6 + 0.07 * (i + 1) as f32, "Calibrating lens");
+            progress(0.6 + 0.06 * (i + 1) as f32, "Calibrating lens");
+            let (train, held) = split_held_out(&project.control_points);
+            let before = held_out_error(project, &held);
             let backup = project.clone();
-            let before =
-                optimize::error_stats(project, &project.control_points, &project.images.iter().map(|i| i.lens).collect::<Vec<_>>()).0;
-            let r = run(project, *flags, 2.5 * px_mean);
-            let sane = project.lenses.iter().all(|l| l.hfov.is_finite() && l.hfov > 1.0 && (l.a.abs() + l.b.abs() + l.c.abs()) < 0.9);
-            if !sane || r.rms > before * 1.001 {
+            optimize::optimize(
+                project,
+                &train,
+                &OptOptions { flags, huber_px: 2.5 * px_mean, max_iters: 60, fov_prior: fov_prior.clone(), fixed: fixed.clone() },
+            );
+            let after = held_out_error(project, &held);
+            if !lenses_sane(project) || after > before * 0.997 {
                 *project = backup;
                 continue;
             }
-            report.log.push(format!("Calibrated {label}: RMS {:.2} → {:.2} px", before, r.rms));
+            if flags.k && !k_on {
+                k_on = true;
+                let ks: Vec<String> = project.lenses.iter().filter(|l| l.is_fisheye()).map(|l| l.projection_label()).collect();
+                report.log.push(format!("Calibrated projection: {} (held-out error {before:.2} → {after:.2} px)", ks.join(", ")));
+            } else {
+                report.log.push(format!("Calibrated {label}: held-out error {before:.2} → {after:.2} px"));
+            }
             prune(project, floor * 2.5, 3.5);
         }
     } else {
@@ -1101,14 +1120,14 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
                 b: true,
                 c: true,
                 shift: project.control_points.len() / project.lenses.len().max(1) >= 150,
+                k: k_on,
             }
         } else {
             LensFlags::NONE
         };
         let backup = project.clone();
         let r = run(project, flags, 2.0 * px_mean);
-        let sane = project.lenses.iter().all(|l| l.hfov.is_finite() && (l.a.abs() + l.b.abs() + l.c.abs()) < 0.9);
-        if !sane {
+        if !lenses_sane(project) {
             *project = backup;
         } else {
             report.log.push(format!("Guided matching: {} points, RMS {:.2} px", project.control_points.len(), r.rms));
@@ -1130,6 +1149,52 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
     Ok(report)
 }
 
+/// Lens parameters still describe a plausible lens.
+fn lenses_sane(project: &Project) -> bool {
+    project.lenses.iter().all(|l| l.hfov.is_finite() && l.hfov > 1.0 && l.k().is_finite() && (l.a.abs() + l.b.abs() + l.c.abs()) < 0.9)
+}
+
+/// Every fifth control point of each pair is held out to judge whether a new lens parameter
+/// predicts, rather than just fits.
+fn split_held_out(cps: &[ControlPoint]) -> (Vec<ControlPoint>, Vec<ControlPoint>) {
+    let mut count: HashMap<(u32, u32), usize> = HashMap::new();
+    let (mut train, mut held) = (Vec::with_capacity(cps.len()), Vec::with_capacity(cps.len() / 5 + 1));
+    for c in cps {
+        let k = count.entry((c.a, c.b)).or_default();
+        if *k % 5 == 2 {
+            held.push(*c);
+        } else {
+            train.push(*c);
+        }
+        *k += 1;
+    }
+    (train, held)
+}
+
+/// RMS distance of the best 90 % of held-out control points (a few mismatches should not decide).
+fn held_out_error(project: &Project, held: &[ControlPoint]) -> f64 {
+    let models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
+    let mut e: Vec<f64> = held
+        .iter()
+        .map(|c| {
+            let (a, b) = (c.a as usize, c.b as usize);
+            optimize::cp_error(
+                c,
+                &project.images[a].rot(),
+                &project.images[b].rot(),
+                &models[project.images[a].lens],
+                &models[project.images[b].lens],
+            )
+        })
+        .collect();
+    if e.is_empty() {
+        return 0.0;
+    }
+    e.sort_by(|a, b| a.total_cmp(b));
+    let keep = &e[..(e.len() * 9 / 10).max(1)];
+    (keep.iter().map(|x| x * x).sum::<f64>() / keep.len() as f64).sqrt()
+}
+
 /// Final optimisation pass after control points have been refined: tight robust threshold, all
 /// lens parameters the data supports, outliers dropped. Returns (RMS, max) in source pixels.
 pub fn polish(project: &mut Project, opts: &AlignOptions) -> (f64, f64) {
@@ -1145,8 +1210,10 @@ pub fn polish(project: &mut Project, opts: &AlignOptions) -> (f64, f64) {
     let fov_prior: Vec<Option<(f64, f64)>> = project.lenses.iter().map(|l| Some((l.hfov, (l.hfov * 0.02).max(0.2)))).collect();
     let per_lens = project.control_points.len() / project.lenses.len().max(1);
     let user_lens = opts.lens.is_some();
+    // The projection factor keeps moving only if alignment found it worth fitting.
+    let k = project.lenses.iter().any(|l| l.k.is_some() && l.is_fisheye());
     let flags = if opts.optimize_lens && per_lens >= 30 {
-        LensFlags { fov: !user_lens, a: per_lens >= 80, b: true, c: per_lens >= 80, shift: per_lens >= 150 }
+        LensFlags { fov: !user_lens, a: per_lens >= 80, b: true, c: per_lens >= 80, shift: per_lens >= 150, k: k && !user_lens }
     } else {
         LensFlags::NONE
     };
@@ -1161,8 +1228,7 @@ pub fn polish(project: &mut Project, opts: &AlignOptions) -> (f64, f64) {
             &cps,
             &OptOptions { flags, huber_px: 2.5 * med, max_iters: 60, fov_prior: fov_prior.clone(), fixed: fixed.clone() },
         );
-        let sane = project.lenses.iter().all(|l| l.hfov.is_finite() && l.hfov > 1.0 && (l.a.abs() + l.b.abs() + l.c.abs()) < 0.9);
-        if !sane {
+        if !lenses_sane(project) {
             *project = backup;
             break;
         }
