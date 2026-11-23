@@ -101,6 +101,29 @@ fn fisheye_sphere_matches_ground_truth() {
 }
 
 #[test]
+fn equisolid_fisheye_projection_is_recovered() {
+    // Most real fisheyes are equisolid, not equidistant; the solver must find that by itself.
+    let mut lens = Lens::new(LensKind::FisheyeEquisolid, 110.0, 640, 960);
+    lens.b = -0.02;
+    let poses = [
+        (0.0, 2.0, 1.0),
+        (61.0, -1.0, -2.0),
+        (119.0, 3.0, 0.5),
+        (182.0, 0.0, 1.5),
+        (240.0, -2.0, -1.0),
+        (301.0, 1.0, 0.0),
+        (10.0, 88.0, 0.0),
+        (30.0, -86.0, 5.0),
+    ];
+    let scene = build(lens, &poses, false, false);
+    let est = scene.project.lenses[0];
+    assert!((est.k() + 0.5).abs() < 0.2, "projection factor {:.2} (equisolid is -0.5)", est.k());
+    // One source pixel is about 0.17° at the centre of these small frames.
+    let err = orientation_error_deg(&scene);
+    assert!(err < 0.3, "orientation error {err:.3}°");
+}
+
+#[test]
 fn rectilinear_partial_panorama_matches_ground_truth() {
     let mut lens = Lens::new(LensKind::Rectilinear, 60.0, 900, 600);
     lens.b = -0.04;
