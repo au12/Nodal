@@ -27,8 +27,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let mut pano =
-        Panorama { width: w, height: h, rgb, alpha, full_width: w, full_height: h, crop_x: 0, crop_y: 0, stats: Default::default() };
+    let mut pano = Panorama::from_rgb8(w, h, &rgb, alpha);
     let t = Instant::now();
     let report = fill_poles(&mut pano, &FillOptions::default(), &|_, _| {});
     println!("{report:?} in {:.2?}", t.elapsed());

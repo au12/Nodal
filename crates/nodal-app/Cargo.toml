@@ -16,6 +16,11 @@ path = "src/lib.rs"
 name = "nodal"
 path = "src/main.rs"
 
+[features]
+default = ["ml"]
+# Learned rescue matcher in the stitcher (statically links ONNX Runtime, ~25 MB).
+ml = ["nodal-stitch/ml"]
+
 [dependencies]
 nodal-core = { path = "../nodal-core" }
 nodal-render = { path = "../nodal-render" }

@@ -116,11 +116,13 @@ binary is a command-line tool:
 
 ```sh
 nodal stitch IMG_*.jpg -o pano.jpg                          # stitch photos into a panorama
+nodal stitch RAW/*.CR3 -o pano.tif                          # RAW in, 16-bit TIFF out (also .png, .psd)
 nodal stitch IMG_*.jpg -o pano.jpg --nadir-patch 25 --tour my-tour   # paint out the tripod, build a tour
 nodal tile -o my-tour --title "My Tour" a.jpg b.jpg c.jpg   # create or extend a tour from panoramas
 nodal render my-tour --projection little-planet --size 3840x2160 -o planet.jpg   # headless GPU still
 nodal info my-tour                                          # summary + broken links
 nodal bench                                                 # time the stitcher on this machine
+nodal bench --suite                                         # accuracy against ground truth
 ```
 
 `--projection` accepts `rectilinear`, `fisheye`, `stereographic`, `little-planet`, `pannini` and `equirect`.
@@ -131,43 +133,69 @@ viewer (`?tour=path/to/tour.json`).
 
 Stitching is fully automatic, and every step can be inspected or overridden in the workspace.
 
-- **Any lens, any order.** Rectilinear and fisheye lenses, single-row, multi-row and full-sphere
-  sets. The lens type and field of view come from EXIF when available and are otherwise estimated
-  from the photos themselves.
-- **Sub-pixel alignment.** Scale- and rotation-invariant features are matched between every
-  overlapping pair, verified geometrically and then polished at full resolution by correlation.
-  A bundle adjustment solves all orientations together with the field of view, radial distortion
-  (a, b, c) and lens shift, discarding outliers as it goes.
-- **Local alignment.** Where real photos still disagree (slight parallax, lens quirks), each photo
-  gets a smooth correction field so matched points land on the same pixel.
-- **Invisible seams.** Exposure and white balance are equalised, seams are routed by minimum cuts
-  through areas where the photos agree, and multi-band blending mixes each frequency band over a
-  distance that suits it.
-- **Pole patching.** Gaps at the zenith and nadir are filled automatically: lighting is continued
-  smoothly across the gap and texture is synthesised from the surrounding image. `--nadir-patch`
-  also paints out a tripod.
+- **Any camera file.** JPEG, PNG, WebP, 8/16/32-bit TIFF (BigTIFF included), Photoshop PSD/PSB, and
+  RAW from most cameras (CR3, CR2, NEF, ARW, RAF, DNG, ORF, RW2 and more, decoded by
+  [FlashRaw](https://crates.io/crates/flashraw)). Everything is processed scene-linear in floating
+  point, embedded ICC profiles are honoured, and all RAW frames share one white balance so colours
+  match across the set.
+- **Any lens.** Rectilinear and fisheye. The fisheye's projection (equidistant, equisolid,
+  stereographic or anything in between) is measured from the photos, together with field of view,
+  radial distortion, lens shift and vignetting. A lens parameter is only kept if it predicts control
+  points it was not fitted to.
+- **Every photo placed.** All overlaps are verified and placed at once by robust rotation averaging,
+  so rings close and a false match is voted out by the cycles it breaks. When features cannot connect a
+  photo (low texture, cloudy sky, repeated patterns), a learned matcher (RaCo-ALIKED + LightGlue on
+  ONNX Runtime) tries again; its models download once, about 65 MB, the first time they are needed
+  (`--no-learned` turns it off). Photos with nothing to match at all, like clear sky, are placed from
+  the shooting pattern where they fill a gap, and flagged as such.
+- **Dense overlap registration.** After the global solve every overlap is measured densely at
+  sub-pixel precision, which feeds a second adjustment and smooth per-photo warps that take out the
+  parallax of hand-held shooting.
+- **Invisible seams.** Exposure, white balance and vignetting are solved jointly from the overlaps.
+  Moving people and shadows are found by consensus and kept out of the blend, seams are routed by
+  minimum cuts through areas where the photos agree, and multi-band blending mixes each frequency band
+  over a distance that suits it.
+- **No holes.** Zenith, nadir and any gap between photos are filled with smooth, texture-matched
+  patches (or left transparent: turn off *Fill voids*). `--nadir-patch` also paints out a tripod.
 - **Level and centred.** The horizon is levelled automatically; drag the preview to re-centre it.
   While you drag, the preview is re-projected live on the GPU.
-- **Output.** JPEG, PNG or TIFF at the photos' native resolution or any size, with Photo Sphere
-  (GPano) metadata. Partial panoramas are trimmed to a clean rectangle. One click builds a tour.
-- **Projects.** Save a stitch as a `.nodal` file and reopen it later with its alignment, lens and
-  settings intact.
+- **Output.** 8-bit JPEG, or 16-bit TIFF (BigTIFF when large), PNG and PSD/PSB, with an sRGB profile
+  and Photo Sphere (GPano) metadata, at the photos' native resolution or any size. Full-resolution
+  photos are streamed from disk while rendering, and RAWs are decoded at half size when the output
+  cannot use more. Partial panoramas are trimmed to a clean rectangle. One click builds a tour.
+- **A workspace that shows its work.** A heat map of every control point's residual on the preview,
+  a per-photo agreement dot, the weakest links by name, a mask painter for anything that should not
+  appear (people, a tripod leg, your shadow) and a control point table.
+- **Projects.** Save a stitch as a `.nodal` file and reopen it later with its alignment, lens, masks
+  and settings intact.
 
 ![Nadir gap before and after patching](docs/screenshots/pole-patch.jpg)
 
 *Looking straight down in a 23-photo panorama: the gap the photos left under the camera (left) and
 the automatic patch (right).*
 
-**Accuracy.** The test suite renders synthetic photo sets from a known panorama through a known
-lens, stitches them and compares against the truth. For a six-shot fisheye sphere the recovered
-field of view is within 1° of the true 165°, orientations within 0.15°, and control points agree to
-about 0.2 px.
+**Accuracy.** `nodal bench --suite` renders photo sets from a known panorama through lenses the
+solver is not told about, stitches them end to end and measures *true misregistration*: how far
+apart the solved model places the same scene point in two photos, in source pixels. That is the
+ghosting you would see, and unlike control-point error the optimiser cannot flatter it.
+
+| Set | Placed | Median | 95th pct | Max | Lens found |
+|---|---|---|---|---|---|
+| 8 fisheye frames, equidistant | 8/8 | 0.03 px | 0.08 px | 0.27 px | equidistant 110.0° |
+| 8 fisheye frames, equisolid | 8/8 | 0.04 px | 0.14 px | 1.2 px | equisolid (k = −0.48) 110.0° |
+| 8 fisheye frames, stereographic | 8/8 | 0.03 px | 0.08 px | 0.61 px | stereographic (k = 0.42) 110.0° |
+| 31 low-texture rectilinear frames, five rows | 31/31 | 0.07 px | 0.19 px | 0.92 px | 65.0° (learned matcher on 24 pairs) |
+| 7 rectilinear frames, partial panorama | 7/7 | 0.09 px | 0.24 px | 0.49 px | 60.0° |
+
+For comparison, 0.2 treated every fisheye as equidistant (on a 180° equisolid set that left errors up
+to 7.2 px at the frame edges) and placed 11 of the 31 low-texture photos.
 
 **Limits to know about.** Stitching currently runs in the native app and CLI, not in the web or
-Docker UI. Photos are processed as 8-bit RGB (RAW files and exposure brackets are on the
-[roadmap](ROADMAP.md)). Pole patches are synthesised, not photographed: plain sky, pavement, grass
-and floors come out convincingly, while complex structure directly overhead (a station roof, a
-street canyon) can look invented.
+Docker UI, and on the CPU (the GPU path is on the [roadmap](ROADMAP.md)). Exposure brackets are not
+merged into HDR yet. Pole patches are synthesised, not photographed: plain sky, pavement, grass and
+floors come out convincingly, while complex structure directly overhead (a station roof, a street
+canyon) can look invented. A frame of pure sky in a row the photos never established cannot be
+placed.
 
 ## Features
 
@@ -192,8 +220,10 @@ street canyon) can look invented.
   areas, drag to move, undo and redo, set start views and north, and reorder or add scenes.
 
 **Stitcher**
-- A complete stitching engine (see [Stitching](#stitching)): feature matching, lens calibration,
-  bundle adjustment, local alignment, minimum-cut seams, multi-band blending and pole patching.
+- A complete stitching engine (see [Stitching](#stitching)): RAW, TIFF and PSD input, a linear float
+  pipeline, feature and learned matching, rotation averaging, lens calibration, dense overlap
+  registration, parallax warps, photometric calibration, ghost masks, minimum-cut seams, multi-band
+  blending, void filling and 16-bit output.
 - Multi-threaded throughout, with a GPU live preview while you re-centre or level the panorama.
 
 **Tiler and server**
@@ -209,6 +239,10 @@ street canyon) can look invented.
 **Stitching workspace (native)**
 
 ![Stitching workspace](docs/screenshots/native-stitch.jpg)
+
+| Residual heat map | Mask painter |
+|---|---|
+| ![Heat map](docs/screenshots/native-stitch-heat.jpg) | ![Mask painter](docs/screenshots/native-stitch-mask.jpg) |
 
 **Desktop (web)**
 
@@ -255,7 +289,7 @@ flowchart LR
 | Crate | What it does |
 |---|---|
 | `nodal-core` | Projections (forward and inverse), cube mapping, the tile pyramid and the tour model. Pure math with unit tests. |
-| `nodal-stitch` | The stitching engine: EXIF and lens models, features and matching, bundle adjustment, local alignment, warping, seams, blending and pole patching. |
+| `nodal-stitch` | The stitching engine: RAW/TIFF/PSD decoding, EXIF and lens models, features, learned rescue matching (`ml` feature), rotation averaging, bundle adjustment, dense registration and warps, photometric calibration, seams, blending, void filling and 16-bit encoding. |
 | `nodal-tiler` | Converts equirect images into bordered multi-resolution cube tiles, thumbnails and `tour.json`. |
 | `nodal-render` | The wgpu renderer: per-pixel projection shader, virtual-texture atlas and page table, streaming, transitions, headless rendering and the live stitch-preview compositor. |
 | `nodal-app` | The `nodal` binary (app and CLI) and the WASM web viewer, built on eframe/egui. |
@@ -403,8 +437,9 @@ Gatekeeper step.
 
 ## Roadmap
 
-Coming up next are mask painting and a control point editor, exposure-bracket (HDR) and RAW input,
-GPU blending, stitching in the Docker web UI, a notarized Mac app and a Windows installer. See **[ROADMAP.md](ROADMAP.md)** for the full plan and known limitations.
+Coming up next are GPU warping and blending, exposure-bracket (HDR) merging, global multi-label seams,
+viewpoint-corrected nadir shots, stitching in the Docker web UI, a notarized Mac app and a Windows
+installer. See **[ROADMAP.md](ROADMAP.md)** for the full plan and known limitations.
 
 ## Numbers
 
@@ -416,6 +451,8 @@ much faster. Run `nodal bench` to measure your own machine.
 | Align 8 fisheye photos (features, matching, calibration, sub-pixel refinement) | 4.7 s |
 | Align 23 rectilinear photos in three rows (8,800 control points) | 15 s |
 | Render that set to 6000×3000 with seams, blending and both poles patched | 14 s |
+| Align 41 hand-held 20 MP RAW frames (CR3): matching, rotation averaging, 218,000 dense measurements, warps, photometric solve | 55 s |
+| Render them to 8192×4096 16-bit TIFF (half-size RAW decode) | 41 s |
 | Tile an 8192×4096 panorama (510 tiles, 4 levels) | 3.1 s |
 | Headless 3840×2160 little-planet render (CPU Vulkan, lavapipe) | 1.2 s |
 | GPU vs CPU reference, all projections | 31–38 dB PSNR |
@@ -426,8 +463,9 @@ much faster. Run `nodal bench` to measure your own machine.
 
 Nodal is an original, independent implementation. It contains no code from any commercial panorama
 viewer or stitcher and was not derived from one. It uses only published techniques: SIFT features,
-bundle adjustment, graph-cut seams, Laplacian-pyramid blending, PatchMatch synthesis, cube maps, mip
-pyramids, virtual texturing and standard map projections.
+learned features and matching (RaCo, ALIKED, LightGlue), rotation averaging, bundle adjustment,
+block-correlation registration, graph-cut seams, Laplacian-pyramid blending, PatchMatch synthesis,
+cube maps, mip pyramids, virtual texturing and standard map projections.
 
 ## Credits
 
@@ -435,5 +473,12 @@ Demo panoramas, and the synthetic photo sets in the stitching screenshots, come 
 [Poly Haven](https://polyhaven.com) (CC0). The UI font is
 [Inter](https://rsms.me/inter/) (SIL Open Font License, `crates/nodal-app/assets/Inter-OFL.txt`).
 Nodal is built on [wgpu](https://wgpu.rs), [egui](https://egui.rs) and [axum](https://github.com/tokio-rs/axum).
+RAW decoding is [FlashRaw](https://crates.io/crates/flashraw), colour management
+[moxcms](https://crates.io/crates/moxcms), and the learned matcher runs on
+[ONNX Runtime](https://onnxruntime.ai) through [ort](https://ort.pyke.io).
+
+The learned matcher's models are downloaded at first use, not shipped: RaCo (Apache-2.0, ETH Zürich
+CVG), ALIKED descriptors (BSD-3-Clause, Zhao et al.) and LightGlue (Apache-2.0, ETH Zürich CVG), in
+the ONNX exports published by [kornia](https://huggingface.co/kornia).
 
 Nodal is MIT licensed; see [LICENSE](LICENSE).

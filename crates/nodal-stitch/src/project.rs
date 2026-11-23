@@ -109,6 +109,10 @@ pub struct SourceImage {
     /// Whether alignment placed this image.
     #[serde(default)]
     pub aligned: bool,
+    /// Placed from the shooting pattern (capture order and its neighbours' poses) because it has
+    /// nothing to match (clear sky, a blank wall), not measured from content.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
     #[serde(default = "yes")]
     pub enabled: bool,
     /// Linear-light RGB gain from exposure and white-balance compensation.
@@ -116,6 +120,89 @@ pub struct SourceImage {
     pub gain: [f32; 3],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warp: Option<WarpField>,
+    /// Parts of the photo that must not appear in the panorama (people, the photographer's
+    /// shadow, a tripod leg).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<ImageMask>,
+}
+
+/// A low-resolution exclusion mask over a photo, stored as run lengths so projects stay small.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ImageMask {
+    pub w: u32,
+    pub h: u32,
+    /// Row-major run lengths alternating keep / exclude, starting with keep.
+    pub runs: Vec<u32>,
+    #[serde(skip)]
+    bits: std::sync::OnceLock<Vec<bool>>,
+}
+
+impl PartialEq for ImageMask {
+    fn eq(&self, other: &Self) -> bool {
+        self.w == other.w && self.h == other.h && self.runs == other.runs
+    }
+}
+
+impl ImageMask {
+    /// Builds a mask from `w × h` flags (true = exclude).
+    pub fn from_bits(w: u32, h: u32, bits: &[bool]) -> ImageMask {
+        let mut runs = Vec::new();
+        let mut cur = false;
+        let mut len = 0u32;
+        for &b in bits {
+            if b == cur {
+                len += 1;
+            } else {
+                runs.push(len);
+                cur = b;
+                len = 1;
+            }
+        }
+        runs.push(len);
+        ImageMask { w, h, runs, bits: std::sync::OnceLock::new() }
+    }
+
+    pub fn bits(&self) -> &[bool] {
+        self.bits.get_or_init(|| {
+            let mut out = Vec::with_capacity((self.w * self.h) as usize);
+            let mut v = false;
+            for &r in &self.runs {
+                out.extend(std::iter::repeat_n(v, r as usize));
+                v = !v;
+            }
+            out.resize((self.w * self.h) as usize, false);
+            out
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.len() <= 1
+    }
+
+    /// Whether full-resolution pixel `(x, y)` of a `sw × sh` photo is excluded.
+    #[inline]
+    pub fn excluded(&self, x: f32, y: f32, sw: f32, sh: f32) -> bool {
+        let mx = ((x / sw * self.w as f32) as i64).clamp(0, self.w as i64 - 1) as usize;
+        let my = ((y / sh * self.h as f32) as i64).clamp(0, self.h as i64 - 1) as usize;
+        self.bits()[my * self.w as usize + mx]
+    }
+
+    /// Fraction of the photo excluded.
+    pub fn coverage(&self) -> f32 {
+        let b = self.bits();
+        b.iter().filter(|x| **x).count() as f32 / b.len().max(1) as f32
+    }
+}
+
+/// How RAW files are developed. Every frame of a panorama uses the same settings so colours match.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Develop {
+    /// White balance multipliers (R, G, B) for RAW files; `None` uses each file's as-shot balance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub white_balance: Option<[f32; 3]>,
+    /// Exposure adjustment in stops applied to the whole panorama.
+    #[serde(default)]
+    pub exposure: f32,
 }
 
 fn yes() -> bool {
@@ -187,10 +274,45 @@ pub enum OutputProjection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PoleFill {
-    /// Fill zenith/nadir gaps when the panorama otherwise wraps the full 360°.
+    /// Fill voids: zenith/nadir gaps of full spheres and holes between photos.
     #[default]
     Auto,
+    /// Leave voids empty (transparent in PNG/TIFF output).
     Off,
+}
+
+/// File format of the stitched panorama.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    #[default]
+    Jpeg,
+    /// 16-bit TIFF (with alpha where there are voids).
+    Tiff16,
+    /// 16-bit PNG.
+    Png16,
+    /// 16-bit Photoshop (PSD, or PSB for very large panoramas).
+    Psd16,
+}
+
+impl OutputFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            OutputFormat::Jpeg => "jpg",
+            OutputFormat::Tiff16 => "tif",
+            OutputFormat::Png16 => "png",
+            OutputFormat::Psd16 => "psd",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OutputFormat::Jpeg => "JPEG (8-bit)",
+            OutputFormat::Tiff16 => "TIFF (16-bit)",
+            OutputFormat::Png16 => "PNG (16-bit)",
+            OutputFormat::Psd16 => "Photoshop (16-bit)",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -220,6 +342,11 @@ pub struct OutputSettings {
     /// Crop partial panoramas to the largest rectangle with no uncovered corners.
     #[serde(default = "yes")]
     pub trim_edges: bool,
+    /// Correct lens vignetting (estimated from the overlaps).
+    #[serde(default = "yes")]
+    pub vignetting_correction: bool,
+    #[serde(default)]
+    pub format: OutputFormat,
 }
 
 fn default_quality() -> u8 {
@@ -240,6 +367,8 @@ impl Default for OutputSettings {
             zenith_patch: 0.0,
             jpeg_quality: 95,
             trim_edges: true,
+            vignetting_correction: true,
+            format: OutputFormat::Jpeg,
         }
     }
 }
@@ -255,6 +384,8 @@ pub struct Project {
     pub control_points: Vec<ControlPoint>,
     #[serde(default)]
     pub output: OutputSettings,
+    #[serde(default)]
+    pub develop: Develop,
 }
 
 impl Default for Project {
@@ -265,6 +396,7 @@ impl Default for Project {
             lenses: Vec::new(),
             control_points: Vec::new(),
             output: OutputSettings::default(),
+            develop: Develop::default(),
         }
     }
 }
@@ -328,6 +460,7 @@ mod tests {
     fn ypr_round_trip() {
         for &(y, p, r) in &[(0.0, 0.0, 0.0), (40.0, 10.0, 0.0), (-120.0, -35.0, 12.0), (170.0, 60.0, -80.0)] {
             let mut img = SourceImage {
+                estimated: false,
                 path: PathBuf::new(),
                 name: String::new(),
                 width: 1,
@@ -339,6 +472,7 @@ mod tests {
                 enabled: true,
                 gain: [1.0; 3],
                 warp: None,
+                mask: None,
             };
             img.set_rot(&rotation_from_ypr(y, p, r));
             let (yy, pp, rr) = img.yaw_pitch_roll();

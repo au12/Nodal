@@ -13,7 +13,7 @@ use crate::blend::{expand, extrapolated_pyramid, reduce, Plane};
 use crate::lens::V3;
 use crate::matching::Rng;
 use crate::render::Panorama;
-use crate::synth::sample_bicubic;
+
 use crate::Progress;
 use rayon::prelude::*;
 use std::f64::consts::{PI, TAU};
@@ -37,8 +37,46 @@ impl Default for FillOptions {
     }
 }
 
+/// Catmull-Rom sample of 16-bit RGB in 8-bit units (the synthesis works on a 0–255 scale).
+#[inline]
+fn sample_bicubic_u16(data: &[u16], w: usize, h: usize, x: f32, y: f32, wrap_x: bool) -> [f32; 3] {
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = fx.floor();
+    let y0 = fy.floor();
+    let cubic = |t: f32| {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        [-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2]
+    };
+    let wx = cubic(fx - x0);
+    let wy = cubic(fy - y0);
+    let (x0, y0) = (x0 as isize, y0 as isize);
+    let mut out = [0.0f32; 3];
+    for (j, wyj) in wy.iter().enumerate() {
+        let yy = (y0 - 1 + j as isize).clamp(0, h as isize - 1) as usize;
+        let mut row = [0.0f32; 3];
+        for (i, wxi) in wx.iter().enumerate() {
+            let xi = x0 - 1 + i as isize;
+            let xx = if wrap_x { xi.rem_euclid(w as isize) as usize } else { xi.clamp(0, w as isize - 1) as usize };
+            let p = &data[(yy * w + xx) * 3..(yy * w + xx) * 3 + 3];
+            row[0] += wxi * p[0] as f32;
+            row[1] += wxi * p[1] as f32;
+            row[2] += wxi * p[2] as f32;
+        }
+        out[0] += wyj * row[0];
+        out[1] += wyj * row[1];
+        out[2] += wyj * row[2];
+    }
+    [out[0] / 257.0, out[1] / 257.0, out[2] / 257.0]
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FillReport {
+    /// Share of the panorama that was filled, in percent.
+    pub filled_percent: f32,
+    /// Interior holes filled.
+    pub holes: usize,
     /// Radius of the filled cap in degrees, if a patch was made.
     pub zenith: Option<f32>,
     pub nadir: Option<f32>,
@@ -72,11 +110,21 @@ fn excess_shift(delta: [f32; 3], rho: f32) -> [f32; 3] {
 pub fn pole_gap(pano: &Panorama, top: bool, max_gap: f32) -> Option<f32> {
     let (w, h) = (pano.width, pano.height);
     let limit = ((max_gap / 180.0) * h as f32).ceil() as usize;
+    // The cap is the void region touching the pole; scattered specks further out are left to the
+    // hole filler. A row belongs to the cap while a noticeable share of it is empty.
     let mut last = None;
+    let mut quiet = 0usize;
     for r in 0..(limit + 2).min(h) {
         let y = if top { r } else { h - 1 - r };
-        if pano.alpha[y * w..(y + 1) * w].contains(&0) {
+        let empty = pano.alpha[y * w..(y + 1) * w].iter().filter(|a| **a == 0).count();
+        if empty as f32 > 0.04 * w as f32 {
             last = Some(r);
+            quiet = 0;
+        } else {
+            quiet += 1;
+            if quiet > 8 + h / 400 {
+                break;
+            }
         }
     }
     let last = last?;
@@ -89,6 +137,8 @@ pub fn pole_gap(pano: &Panorama, top: bool, max_gap: f32) -> Option<f32> {
 /// Pole-centred view: gnomonic (a true top-down view of flat ground) or stereographic.
 #[derive(Clone, Copy)]
 struct View {
+    /// World → view-frame rotation: the view looks along +Y of that frame (−Y when `top` is false).
+    axis: nalgebra::Rotation3<f64>,
     top: bool,
     gnomonic: bool,
     /// Pixels per unit of projected radius.
@@ -125,12 +175,13 @@ impl View {
         let (st, ct) = theta.sin_cos();
         let (cu, cv) = if r > 1e-12 { (u / r, v / r) } else { (1.0, 0.0) };
         let up = if self.top { ct } else { -ct };
-        (V3::new(st * cu, up, st * cv), theta)
+        (self.axis.inverse_transform_vector(&V3::new(st * cu, up, st * cv)), theta)
     }
 
     /// World direction → view pixel.
     #[inline]
     fn pixel(&self, d: V3) -> (f64, f64) {
+        let d = self.axis * d;
         let up = if self.top { d.y } else { -d.y };
         let st = d.x.hypot(d.z);
         let theta = st.atan2(up);
@@ -747,12 +798,33 @@ fn smooth_base(image: &[f32], known: &[bool], hole: &[bool], s: usize, hole_radi
 }
 
 /// Synthesises the patch for one pole at working resolution.
-fn synthesise(pano: &Panorama, top: bool, gap_deg: f32, opts: &FillOptions) -> Option<Synthesis> {
+/// A spherical cap to fill: the poles, or a hole between photos.
+#[derive(Clone, Copy)]
+struct Cap {
+    axis: nalgebra::Rotation3<f64>,
+    /// Geometric orientation of the view (true: looks along +Y of the axis frame).
+    top: bool,
+    /// Sky-like material (smooth gradients allowed) rather than ground.
+    sky: bool,
+    /// Angular radius of the region to fill, degrees.
+    gap_deg: f32,
+    /// Fill everything within `gap_deg` even where photos cover it (tripod removal at the poles).
+    forced: bool,
+}
+
+impl Cap {
+    fn pole(top: bool, gap_deg: f32) -> Cap {
+        Cap { axis: nalgebra::Rotation3::identity(), top, sky: top, gap_deg, forced: true }
+    }
+}
+
+fn synthesise(pano: &Panorama, cap: &Cap, opts: &FillOptions) -> Option<Synthesis> {
+    let (top, gap_deg) = (cap.top, cap.gap_deg);
     let gap = (gap_deg as f64).to_radians();
     // Context ring around the gap to draw material from. Looking down, a gnomonic view shows flat
     // ground at one uniform scale (so borrowed texture has the right size); it is usable while the
     // ring stays clear of the horizon. Otherwise, and for the sky, the view is stereographic.
-    let gnomonic = !top && gap_deg <= 36.0;
+    let gnomonic = !cap.sky && gap_deg <= 36.0;
     // For the ground the ring stays close to the gap: the nearer the material, the closer its real
     // resolution is to what the camera would have recorded straight down.
     let ctx = if gnomonic {
@@ -760,7 +832,7 @@ fn synthesise(pano: &Panorama, top: bool, gap_deg: f32, opts: &FillOptions) -> O
     } else {
         (gap * 2.3 + 10f64.to_radians()).min(82f64.to_radians())
     };
-    let mut view = View { top, gnomonic, f: pano.width as f64 / TAU, size: 0 };
+    let mut view = View { axis: cap.axis, top, gnomonic, f: pano.width as f64 / TAU, size: 0 };
     let full_size = 2.0 * view.f * view.radius(ctx);
     let shrink = (full_size / opts.work_size as f64).max(1.0);
     view.f /= shrink;
@@ -772,7 +844,7 @@ fn synthesise(pano: &Panorama, top: bool, gap_deg: f32, opts: &FillOptions) -> O
 
     // Working-resolution view of the panorama.
     let sub = (shrink.ceil() as usize).clamp(1, 4);
-    let gap_r = view.f * view.radius(gap);
+    let gap_r = if cap.forced { view.f * view.radius(gap) } else { -1.0 };
     let mut image = vec![0.0f32; s * s * 3];
     let mut known = vec![false; s * s];
     let mut hole = vec![false; s * s];
@@ -792,7 +864,7 @@ fn synthesise(pano: &Panorama, top: bool, gap_deg: f32, opts: &FillOptions) -> O
                         if !pano_alpha(pano, px, py) {
                             all = false;
                         }
-                        let c = sample_bicubic(&pano.rgb, pano.width, pano.height, px, py, true);
+                        let c = sample_bicubic_u16(&pano.rgb, pano.width, pano.height, px, py, true);
                         acc[0] += c[0];
                         acc[1] += c[1];
                         acc[2] += c[2];
@@ -855,7 +927,7 @@ fn synthesise(pano: &Panorama, top: bool, gap_deg: f32, opts: &FillOptions) -> O
         for li in 0..=n_levels {
             let known_b: Vec<bool> = kn.data.iter().map(|v| *v > 0.999).collect();
             let hole_b: Vec<bool> = ho.data.iter().map(|v| *v > 0.3).collect();
-            levels.push(finish_level(img.w, img.h, &img.data, bas.data.clone(), known_b, hole_b, top));
+            levels.push(finish_level(img.w, img.h, &img.data, bas.data.clone(), known_b, hole_b, cap.sky));
             if li == n_levels {
                 break;
             }
@@ -883,7 +955,7 @@ fn synthesise(pano: &Panorama, top: bool, gap_deg: f32, opts: &FillOptions) -> O
     }
 
     // Coarse to fine.
-    let mut rng = Rng::new(0x5EED ^ top as u64);
+    let mut rng = Rng::new(0x5EED ^ top as u64 ^ ((cap.axis.matrix()[(0, 1)] * 1e6) as i64 as u64));
     let mut nnf: Vec<(i32, i32)> = Vec::new();
     for li in (0..=n_levels).rev() {
         let l = &mut levels[li];
@@ -1005,9 +1077,12 @@ fn apply(pano: &mut Panorama, syn: &Synthesis, gap_deg: f32) {
     // Distance (in working pixels) from each ring pixel to the gap, for a short cross-fade into the photo.
     let ring = 3isize;
     let near = dilate(&syn.hole, s, s, ring);
-    // Rows that can contain gap or ring pixels.
-    let extent = ((gap_deg as f64 + 4.0) / 180.0 * h as f64).ceil() as usize + 2 + (ring as usize * 2);
-    let extent = extent.min(h / 2);
+    // Rows that can contain gap or ring pixels: the cap's pitch range.
+    let centre = view.axis.inverse_transform_vector(&V3::new(0.0, if view.top { 1.0 } else { -1.0 }, 0.0));
+    let pc = centre.y.clamp(-1.0, 1.0).asin();
+    let r = (gap_deg as f64 + 4.0).to_radians() + (2 * ring as usize + 2) as f64 * PI / h as f64;
+    let y_top = (((0.5 - (pc + r) / PI) * h as f64).floor().max(0.0)) as usize;
+    let y_bot = (((0.5 - (pc - r) / PI) * h as f64).ceil() as usize).min(h);
     let src_rgb = pano.rgb.clone();
     let src_alpha = pano.alpha.clone();
     let source = Panorama {
@@ -1021,7 +1096,7 @@ fn apply(pano: &mut Panorama, syn: &Synthesis, gap_deg: f32) {
         crop_y: 0,
         stats: Default::default(),
     };
-    let row_range = if view.top { 0..extent } else { h - extent..h };
+    let row_range = y_top..y_bot.max(y_top);
     let y_off = row_range.start;
     let rows = &mut pano.rgb[row_range.start * w * 3..row_range.end * w * 3];
     let arows = &mut pano.alpha[row_range.start * w..row_range.end * w];
@@ -1063,7 +1138,7 @@ fn apply(pano: &mut Panorama, syn: &Synthesis, gap_deg: f32) {
                 let qy = q.1 as f64 + 0.5 + (vy - (cy as f64 + 0.5));
                 let (qd, _) = view.dir(qx, qy);
                 let (px, py) = pano_coords(&source, qd);
-                let c = sample_bicubic(&source.rgb, w, h, px, py, true);
+                let c = sample_bicubic_u16(&source.rgb, w, h, px, py, true);
                 let bq = bilinear3(&syn.base, s, s, qx as f32, qy as f32);
                 let rho = syn.rho[(qy.clamp(0.0, (s - 1) as f64) as usize) * s + (qx.clamp(0.0, (s - 1) as f64) as usize)];
                 let ex = excess_shift([bp[0] - bq[0], bp[1] - bq[1], bp[2] - bq[2]], rho);
@@ -1102,9 +1177,10 @@ fn apply(pano: &mut Panorama, syn: &Synthesis, gap_deg: f32) {
                 continue;
             }
             for c in 0..3 {
-                let orig = row[x * 3 + c] as f32;
+                // The synthesis works in 8-bit units; the panorama stores 16-bit.
+                let orig = row[x * 3 + c] as f32 / 257.0;
                 let v = if covered { orig + (synth[c] - orig) * mix } else { synth[c] };
-                row[x * 3 + c] = (v + 0.5).clamp(0.0, 255.0) as u8;
+                row[x * 3 + c] = (v * 257.0 + 0.5).clamp(0.0, 65535.0) as u16;
             }
             arow[x] = 255;
         }
@@ -1134,7 +1210,7 @@ pub fn fill_poles(pano: &mut Panorama, opts: &FillOptions, progress: Progress) -
             None => continue,
         };
         progress(k as f32 * 0.5, if top { "Patching zenith" } else { "Patching nadir" });
-        if let Some(syn) = synthesise(pano, top, radius, opts) {
+        if let Some(syn) = synthesise(pano, &Cap::pole(top, radius), opts) {
             apply(pano, &syn, radius);
             if top {
                 report.zenith = Some(radius);
@@ -1147,4 +1223,235 @@ pub fn fill_poles(pano: &mut Panorama, opts: &FillOptions, progress: Progress) -
     }
     progress(1.0, "Poles patched");
     report
+}
+
+/// Fills every void: pole gaps of full spheres and holes between photos.
+pub fn fill_voids(pano: &mut Panorama, opts: &FillOptions, progress: Progress) -> FillReport {
+    let before = pano.alpha.par_iter().filter(|a| **a == 0).count();
+    let mut report = if pano.is_full_sphere() { fill_poles(pano, opts, &|f, s| progress(f * 0.5, s)) } else { FillReport::default() };
+    report.holes = fill_holes(pano, opts, &|f, s| progress(0.5 + 0.5 * f, s));
+    let after = pano.alpha.par_iter().filter(|a| **a == 0).count();
+    report.filled_percent = 100.0 * before.saturating_sub(after) as f32 / (pano.width * pano.height).max(1) as f32;
+    report
+}
+
+/// World direction of a panorama pixel (pixel centres at half-integers).
+fn pano_dir(pano: &Panorama, x: f64, y: f64) -> V3 {
+    let fw = pano.full_width as f64;
+    let fh = pano.full_height as f64;
+    let yaw = ((x + pano.crop_x as f64) / fw - 0.5) * TAU;
+    let pitch = (0.5 - (y + pano.crop_y as f64) / fh) * PI;
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    V3::new(sy * cp, sp, cy * cp)
+}
+
+/// Smooth membrane fill of a small hole: onion peeling (each empty pixel takes the mean of its
+/// filled neighbours, outside in), then a few relaxation passes so no structure from the peel
+/// order shows.
+fn diffuse_fill(pano: &mut Panorama, x0: usize, y0: usize, x1: usize, y1: usize) {
+    let w = pano.width;
+    let (bw, bh) = (x1 - x0, y1 - y0);
+    let mut known: Vec<bool> = (0..bw * bh).map(|i| pano.alpha[(y0 + i / bw) * w + x0 + i % bw] != 0).collect();
+    let hole: Vec<bool> = known.iter().map(|k| !k).collect();
+    let mut val: Vec<[f32; 3]> = (0..bw * bh)
+        .map(|i| {
+            let p = ((y0 + i / bw) * w + x0 + i % bw) * 3;
+            [pano.rgb[p] as f32, pano.rgb[p + 1] as f32, pano.rgb[p + 2] as f32]
+        })
+        .collect();
+    loop {
+        let mut next = Vec::new();
+        for y in 0..bh {
+            for x in 0..bw {
+                let i = y * bw + x;
+                if known[i] {
+                    continue;
+                }
+                let (mut acc, mut n) = ([0.0f32; 3], 0.0f32);
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                        if nx < 0 || ny < 0 || nx >= bw as i32 || ny >= bh as i32 {
+                            continue;
+                        }
+                        let j = ny as usize * bw + nx as usize;
+                        if known[j] {
+                            for c in 0..3 {
+                                acc[c] += val[j][c];
+                            }
+                            n += 1.0;
+                        }
+                    }
+                }
+                if n > 0.0 {
+                    next.push((i, [acc[0] / n, acc[1] / n, acc[2] / n]));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        for (i, v) in next {
+            val[i] = v;
+            known[i] = true;
+        }
+    }
+    for _ in 0..12 {
+        let prev = val.clone();
+        for y in 0..bh {
+            for x in 0..bw {
+                let i = y * bw + x;
+                if !hole[i] {
+                    continue;
+                }
+                let (mut acc, mut n) = ([0.0f32; 3], 0.0f32);
+                for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= bw as i32 || ny >= bh as i32 {
+                        continue;
+                    }
+                    let j = ny as usize * bw + nx as usize;
+                    for c in 0..3 {
+                        acc[c] += prev[j][c];
+                    }
+                    n += 1.0;
+                }
+                if n > 0.0 {
+                    val[i] = [acc[0] / n, acc[1] / n, acc[2] / n];
+                }
+            }
+        }
+    }
+    for y in 0..bh {
+        for x in 0..bw {
+            let i = y * bw + x;
+            if hole[i] && known[i] {
+                let p = ((y0 + y) * w + x0 + x) * 3;
+                for c in 0..3 {
+                    pano.rgb[p + c] = val[i][c].round().clamp(0.0, 65535.0) as u16;
+                }
+                pano.alpha[(y0 + y) * w + x0 + x] = 255;
+            }
+        }
+    }
+}
+
+/// Fills holes between photos (voids that are not pole caps): small ones with a smooth membrane,
+/// larger ones with the same structure-aware patch synthesis as the poles, in a view centred on the
+/// hole so the equirectangular stretch does not distort the borrowed texture. Voids touching the
+/// border of a partial panorama are outside the coverage and stay empty. Returns how many holes
+/// were filled.
+pub fn fill_holes(pano: &mut Panorama, opts: &FillOptions, progress: Progress) -> usize {
+    let (w, h) = (pano.width, pano.height);
+    if w < 16 || h < 16 || !pano.alpha.contains(&0) {
+        return 0;
+    }
+    let wraps = pano.width == pano.full_width;
+    // Label on a reduced grid (a cell is empty if any of its pixels is).
+    let k = (w / 2048).max(1);
+    let (gw, gh) = (w.div_ceil(k), h.div_ceil(k));
+    let mut empty = vec![false; gw * gh];
+    empty.par_chunks_mut(gw).enumerate().for_each(|(gy, row)| {
+        for y in gy * k..((gy + 1) * k).min(h) {
+            let a = &pano.alpha[y * w..(y + 1) * w];
+            for (gx, e) in row.iter_mut().enumerate() {
+                if !*e && a[gx * k..((gx + 1) * k).min(w)].contains(&0) {
+                    *e = true;
+                }
+            }
+        }
+    });
+    let mut label = vec![u32::MAX; gw * gh];
+    let mut comps: Vec<Vec<usize>> = Vec::new();
+    for start in 0..gw * gh {
+        if !empty[start] || label[start] != u32::MAX {
+            continue;
+        }
+        let id = comps.len() as u32;
+        let mut stack = vec![start];
+        label[start] = id;
+        let mut cells = Vec::new();
+        while let Some(c) = stack.pop() {
+            cells.push(c);
+            let (cx, cy) = ((c % gw) as i64, (c / gw) as i64);
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    let ny = cy + dy;
+                    if ny < 0 || ny >= gh as i64 {
+                        continue;
+                    }
+                    let mut nx = cx + dx;
+                    if wraps {
+                        nx = nx.rem_euclid(gw as i64);
+                    } else if nx < 0 || nx >= gw as i64 {
+                        continue;
+                    }
+                    let n = ny as usize * gw + nx as usize;
+                    if empty[n] && label[n] == u32::MAX {
+                        label[n] = id;
+                        stack.push(n);
+                    }
+                }
+            }
+        }
+        comps.push(cells);
+    }
+    let total = comps.len().max(1);
+    let mut filled = 0;
+    for (ci, cells) in comps.iter().enumerate() {
+        progress(ci as f32 / total as f32, "Filling holes");
+        let touches_left_right = !wraps && cells.iter().any(|&c| c % gw == 0 || c % gw == gw - 1);
+        let touches_top_bottom = cells.iter().any(|&c| c / gw == 0 || c / gw == gh - 1);
+        // Outside the coverage of a partial panorama: not a hole.
+        if touches_left_right || (touches_top_bottom && !pano.is_full_sphere()) {
+            continue;
+        }
+        // Pixel bounding box (on a periodic canvas a hole may straddle the seam; skip those rare
+        // cases rather than fill across the wrap incorrectly).
+        let xs: Vec<usize> = cells.iter().map(|&c| c % gw).collect();
+        let ys: Vec<usize> = cells.iter().map(|&c| c / gw).collect();
+        let (gx0, gx1) = (*xs.iter().min().unwrap(), *xs.iter().max().unwrap() + 1);
+        let (gy0, gy1) = (*ys.iter().min().unwrap(), *ys.iter().max().unwrap() + 1);
+        if gx1 - gx0 > gw / 2 {
+            continue;
+        }
+        // Angular centre and radius.
+        let dirs: Vec<V3> =
+            cells.iter().map(|&c| pano_dir(pano, ((c % gw) * k) as f64 + k as f64 * 0.5, ((c / gw) * k) as f64 + k as f64 * 0.5)).collect();
+        let centre = dirs.iter().sum::<V3>().normalize();
+        let cell_angle = k as f64 * TAU / pano.full_width as f64;
+        let radius = dirs.iter().map(|d| crate::global::vec_angle(d, &centre)).fold(0.0f64, f64::max) + cell_angle;
+        if radius.to_degrees() > 45.0 {
+            continue; // too large to invent plausibly
+        }
+        let area_px: usize = cells.len() * k * k;
+        if area_px < 4000 || radius.to_degrees() < 0.6 {
+            let pad = 4 * k;
+            let x0 = (gx0 * k).saturating_sub(pad);
+            let y0 = (gy0 * k).saturating_sub(pad);
+            let x1 = (gx1 * k + pad).min(w);
+            let y1 = (gy1 * k + pad).min(h);
+            diffuse_fill(pano, x0, y0, x1, y1);
+            filled += 1;
+            continue;
+        }
+        let axis = nalgebra::Rotation3::rotation_between(&centre, &V3::y())
+            .unwrap_or_else(|| nalgebra::Rotation3::from_axis_angle(&V3::x_axis(), PI));
+        let cap = Cap { axis, top: true, sky: centre.y > 0.1, gap_deg: radius.to_degrees() as f32, forced: false };
+        if let Some(syn) = synthesise(pano, &cap, opts) {
+            apply(pano, &syn, cap.gap_deg);
+            filled += 1;
+        }
+        // Anything the synthesis could not reach.
+        let pad = 4 * k;
+        let (x0, y0) = ((gx0 * k).saturating_sub(pad), (gy0 * k).saturating_sub(pad));
+        let (x1, y1) = ((gx1 * k + pad).min(w), (gy1 * k + pad).min(h));
+        let left = (y0..y1).any(|y| pano.alpha[y * w + x0..y * w + x1].contains(&0));
+        if left {
+            diffuse_fill(pano, x0, y0, x1, y1);
+        }
+    }
+    progress(1.0, "Holes filled");
+    filled
 }

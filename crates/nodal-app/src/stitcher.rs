@@ -55,6 +55,7 @@ enum Format {
     Jpeg,
     Tiff,
     Png,
+    Psd,
 }
 
 impl Format {
@@ -63,6 +64,7 @@ impl Format {
             Format::Jpeg => "jpg",
             Format::Tiff => "tif",
             Format::Png => "png",
+            Format::Psd => "psd",
         }
     }
 }
@@ -76,6 +78,18 @@ struct Preview {
     filled: (bool, bool),
     /// Canvas window it shows: yaw at the left edge, yaw span, pitch at the top, pitch span (radians).
     window: [f32; 4],
+}
+
+/// Painting an exclusion mask (people, a tripod leg, the photographer's shadow) on one photo.
+struct MaskEditor {
+    photo: usize,
+    tex: TextureHandle,
+    /// Mask resolution and cells (true = leave out).
+    w: usize,
+    h: usize,
+    bits: Vec<bool>,
+    /// Brush radius in mask cells.
+    brush: f32,
 }
 
 struct Saved {
@@ -103,6 +117,8 @@ pub struct Stitcher {
     lens_mode: LensMode,
     lens_fov: f64,
     optimize_lens: bool,
+    /// Learned matcher for photos SIFT cannot connect (downloads its models once).
+    learned: bool,
     width_choice: usize,
     custom_width: u32,
     format: Format,
@@ -115,6 +131,10 @@ pub struct Stitcher {
     roll: f32,
     show_points: bool,
     grid: bool,
+    /// Colour the preview with control point residuals.
+    heat: bool,
+    /// Exclusion mask being painted on one photo.
+    mask_editor: Option<MaskEditor>,
     /// Photos waiting to be loaded once a frame (and its context) is available.
     pending: Vec<PathBuf>,
     /// A saved project waiting for its photos to finish loading.
@@ -151,6 +171,7 @@ impl Default for Stitcher {
             lens_mode: LensMode::Auto,
             lens_fov: 0.0,
             optimize_lens: true,
+            learned: true,
             width_choice: 0,
             custom_width: 8192,
             format: Format::Jpeg,
@@ -162,6 +183,8 @@ impl Default for Stitcher {
             roll: 0.0,
             show_points: false,
             grid: false,
+            heat: false,
+            mask_editor: None,
             pending: Vec::new(),
             pending_project: None,
             gpu_dirty: false,
@@ -173,17 +196,14 @@ impl Default for Stitcher {
 }
 
 fn is_photo(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-        Some("jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp")
-    )
+    nodal_stitch::decode::is_supported_path(p)
 }
 
 /// True when every image looks like a finished equirectangular panorama (2:1) rather than a
-/// photo to be stitched.
+/// photo to be stitched. Camera RAW files are always photos.
 pub fn all_panoramas(paths: &[PathBuf]) -> bool {
-    paths.iter().all(|p| match image::image_dimensions(p) {
-        Ok((w, h)) => (w as f32 / h as f32 - 2.0).abs() < 0.03,
+    paths.iter().all(|p| match nodal_stitch::decode::probe(p) {
+        Ok(info) => info.kind != nodal_stitch::decode::SourceKind::Raw && (info.width as f32 / info.height as f32 - 2.0).abs() < 0.03,
         Err(_) => true,
     })
 }
@@ -255,7 +275,13 @@ impl Stitcher {
             (LensMode::Rectilinear, f) => Some((LensKind::Rectilinear, f)),
             (LensMode::Fisheye, f) => Some((LensKind::Fisheye, f)),
         };
-        AlignOptions { lens, optimize_lens: self.optimize_lens, ..Default::default() }
+        #[allow(unused_mut)]
+        let mut opts = AlignOptions { lens, optimize_lens: self.optimize_lens, ..Default::default() };
+        #[cfg(feature = "ml")]
+        if self.learned {
+            opts.rescue = Some(nodal_stitch::align::RescueHandle(std::sync::Arc::new(nodal_stitch::ml::SourceRescue::new(&self.sources))));
+        }
+        opts
     }
 
     fn align(&mut self, ctx: &egui::Context) {
@@ -315,7 +341,7 @@ impl Stitcher {
             self.preview_stale = true;
             return;
         }
-        let Some(mut project) = self.preview_project() else { return };
+        let Some(mut project) = self.project.clone() else { return };
         self.preview_running = true;
         self.preview_stale = false;
         self.preview_generation += 1;
@@ -326,7 +352,8 @@ impl Stitcher {
         project.output.width = 0;
         std::thread::spawn(move || {
             let opts = RenderOptions { width: 1600, seam_width: 800, filter: Filter::Bilinear, bands: Some(4), ..Default::default() };
-            let msg = match nodal_stitch::render(&project, &images, &opts, &|_, _| {}) {
+            let pixels = nodal_stitch::MemoryPixels(images);
+            let msg = match nodal_stitch::render(&project, &pixels, &opts, &|_, _| {}) {
                 Ok(pano) => Msg::Preview { pano: Box::new(pano), generation },
                 Err(e) => Msg::Failed(format!("{e:#}")),
             };
@@ -350,7 +377,7 @@ impl Stitcher {
         let (tx, progress) = self.start("Creating panorama");
         project.output.width = self.output_width();
         let quality = self.quality;
-        let images: Vec<Arc<RgbImage>> = self.sources.iter().map(|s| s.image.clone()).collect();
+        let sources = self.sources.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
@@ -358,7 +385,7 @@ impl Stitcher {
                 *progress.lock().unwrap() = (f * 0.95, s.to_string());
                 ctx.request_repaint();
             };
-            let result = nodal_stitch::render(&project, &images, &RenderOptions::default(), &report).and_then(|pano| {
+            let result = nodal_stitch::render(&project, &sources, &RenderOptions::default(), &report).and_then(|pano| {
                 report(1.0, "Saving");
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
@@ -413,12 +440,8 @@ impl Stitcher {
                 let m = p.lenses[img.lens].model();
                 let r = img.rot();
                 let r = r.matrix();
-                let kind = match m.kind {
-                    LensKind::Rectilinear => 0.0,
-                    LensKind::Fisheye => 1.0,
-                    LensKind::FisheyeEquisolid => 2.0,
-                    LensKind::FisheyeStereographic => 3.0,
-                };
+                // The shader evaluates the continuous projection family directly.
+                let kind = m.k as f32;
                 let g = self.gains.get(i).copied().unwrap_or([1.0; 3]);
                 ComposePhoto {
                     // World → camera is the transpose of camera → world: its rows are the columns of `r`.
@@ -430,6 +453,49 @@ impl Stitcher {
                     limits: [m.rho_max.min(1e9) as f32, m.theta_max as f32, 0.0, 0.0],
                     gain: [g[0], g[1], g[2], if img.aligned && img.enabled { 1.0 } else { 0.0 }],
                 }
+            })
+            .collect()
+    }
+
+    fn open_mask_editor(&mut self, ctx: &egui::Context, i: usize) {
+        let Some(photo) = self.photos.get(i) else { return };
+        let sm = &photo.small;
+        let tex = ctx.load_texture(
+            format!("stitch-mask-{i}"),
+            egui::ColorImage::from_rgb([sm.width() as usize, sm.height() as usize], sm.as_raw()),
+            TextureOptions::LINEAR,
+        );
+        let w = 240usize;
+        let h = ((w as f32 * sm.height() as f32 / sm.width().max(1) as f32).round() as usize).max(1);
+        let mut bits = vec![false; w * h];
+        if let Some(m) = self.project.as_ref().and_then(|p| p.images[i].mask.as_ref()) {
+            let (mw, mh) = (m.w as usize, m.h as usize);
+            let src = m.bits();
+            for y in 0..h {
+                for x in 0..w {
+                    bits[y * w + x] = src[(y * mh / h).min(mh - 1) * mw + (x * mw / w).min(mw - 1)];
+                }
+            }
+        }
+        self.mask_editor = Some(MaskEditor { photo: i, tex, w, h, bits, brush: 6.0 });
+    }
+
+    /// Median control point distance per photo (px), for the photo list.
+    fn photo_residuals(&self) -> Vec<Option<f32>> {
+        let Some(p) = &self.project else { return vec![None; self.photos.len()] };
+        let mut per: Vec<Vec<f32>> = vec![Vec::new(); p.images.len()];
+        for cp in &p.control_points {
+            per[cp.a as usize].push(cp.error);
+            per[cp.b as usize].push(cp.error);
+        }
+        per.into_iter()
+            .map(|mut v| {
+                if v.is_empty() {
+                    return None;
+                }
+                let k = v.len() / 2;
+                v.select_nth_unstable_by(k, |a, b| a.total_cmp(b));
+                Some(v[k])
             })
             .collect()
     }
@@ -468,7 +534,10 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
                     let thumb = ctx.load_texture(format!("stitch-thumb-{name}"), color, TextureOptions::LINEAR);
                     let mut summary = src.exif.summary();
                     if summary.is_empty() {
-                        summary = format!("{} × {}", src.image.width(), src.image.height());
+                        summary = format!("{} × {}", src.width, src.height);
+                    }
+                    if !src.format.is_empty() && src.format != "memory" {
+                        summary = format!("{summary} · {}", src.format);
                     }
                     s.photos.push(Photo { name, summary, small: sm, thumb, layer });
                     s.sources.push(src);
@@ -484,7 +553,7 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
                         && p.images
                             .iter()
                             .zip(&s.sources)
-                            .all(|(img, src)| img.path == src.path && img.width == src.image.width() && img.height == src.image.height())
+                            .all(|(img, src)| img.path == src.path && img.width == src.width && img.height == src.height)
                 });
                 if let Some(project) = restored {
                     s.project = Some(project);
@@ -508,8 +577,9 @@ pub fn poll(app: &mut NodalApp, ctx: &egui::Context) {
             Msg::Preview { pano, generation } => {
                 s.preview_running = false;
                 if generation == s.preview_generation {
+                    let rgb8 = pano.rgb8();
                     let mut rgba = Vec::with_capacity(pano.width * pano.height * 4);
-                    for (p, a) in pano.rgb.as_chunks::<3>().0.iter().zip(&pano.alpha) {
+                    for (p, a) in rgb8.as_chunks::<3>().0.iter().zip(&pano.alpha) {
                         rgba.extend_from_slice(&[p[0], p[1], p[2], *a]);
                     }
                     let img = egui::ColorImage::from_rgba_unmultiplied([pano.width, pano.height], &rgba);
@@ -604,13 +674,14 @@ fn section(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
 }
 
-fn stat(ui: &mut Ui, label: &str, value: impl Into<String>) {
+fn stat(ui: &mut Ui, label: &str, value: impl Into<String>) -> egui::Response {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).color(theme::MUTED));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(RichText::new(value.into()).color(theme::TEXT));
         });
-    });
+    })
+    .response
 }
 
 fn reveal(path: &Path) {
@@ -779,7 +850,7 @@ fn photo_panel(app: &mut NodalApp, ui: &mut Ui) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!app.stitcher.busy(), egui::Button::new("Add…").small()).clicked() {
                         if let Some(files) =
-                            rfd::FileDialog::new().add_filter("Photos", &["jpg", "jpeg", "png", "tif", "tiff", "webp"]).pick_files()
+                            rfd::FileDialog::new().add_filter("Photos and RAW", nodal_stitch::decode::EXTENSIONS).pick_files()
                         {
                             app.stitcher.add_photos(ui.ctx(), files);
                         }
@@ -789,6 +860,8 @@ fn photo_panel(app: &mut NodalApp, ui: &mut Ui) {
             ui.add_space(6.0);
             let s = &mut app.stitcher;
             let mut toggled = false;
+            let mut open_mask = None;
+            let residuals = s.photo_residuals();
             // Control points per photo, for the status line.
             let mut counts = vec![0usize; s.photos.len()];
             if let Some(p) = &s.project {
@@ -820,10 +893,34 @@ fn photo_panel(app: &mut NodalApp, ui: &mut Ui) {
                     let (line, colour) = match s.project.as_ref().map(|p| &p.images[i]) {
                         Some(img) if !img.aligned => ("Not aligned — no overlap found".to_string(), theme::DANGER),
                         Some(img) if !img.enabled => ("Excluded".to_string(), theme::MUTED),
+                        Some(img) if img.estimated => ("From the shooting pattern".to_string(), theme::ACCENT),
+                        Some(img) if img.mask.as_ref().is_some_and(|m| !m.is_empty()) => {
+                            (format!("{} points · masked", counts[i]), theme::MUTED)
+                        }
                         Some(_) => (format!("{} · {} points", photo.summary, counts[i]), theme::MUTED),
                         None => (photo.summary.clone(), theme::MUTED),
                     };
                     painter.text(pos2(x, rect.top() + 29.0), Align2::LEFT_TOP, line, theme::body_font(11.5), colour);
+                    // How well this photo agrees with its neighbours.
+                    if let Some(Some(e)) = residuals.get(i) {
+                        let c = heat_colour(*e);
+                        ui.painter().circle(thumb.right_top() + vec2(-4.0, 4.0), 4.0, c, Stroke::new(1.0, Color32::from_black_alpha(160)));
+                    }
+                    // contains_pointer, not hovered: the button itself takes the hover once it is shown.
+                    if resp.contains_pointer() || s.mask_editor.as_ref().is_some_and(|m| m.photo == i) {
+                        let b = Rect::from_center_size(pos2(rect.right() - 42.0, rect.center().y), vec2(22.0, 22.0));
+                        let mresp =
+                            ui.interact(b, resp.id.with("mask"), Sense::click()).on_hover_text("Paint what to leave out of this photo");
+                        let hot = mresp.hovered();
+                        ui.painter().circle_stroke(b.center(), 8.0, Stroke::new(1.5, if hot { theme::ACCENT } else { theme::MUTED }));
+                        ui.painter().line_segment(
+                            [b.center() + vec2(-3.5, 3.5), b.center() + vec2(3.5, -3.5)],
+                            Stroke::new(1.5, if hot { theme::ACCENT } else { theme::MUTED }),
+                        );
+                        if mresp.clicked() {
+                            open_mask = Some(i);
+                        }
+                    }
                     // Include / exclude toggle.
                     if let Some(p) = &mut s.project {
                         if p.images[i].aligned {
@@ -858,7 +955,17 @@ fn photo_panel(app: &mut NodalApp, ui: &mut Ui) {
             if toggled {
                 s.request_preview(ui.ctx());
             }
+            if let Some(i) = open_mask {
+                s.open_mask_editor(ui.ctx(), i);
+            }
         });
+}
+
+/// Residual colour: green under a pixel, through amber, red from about four pixels.
+fn heat_colour(e: f32) -> Color32 {
+    let t = ((e - 0.7) / 3.3).clamp(0.0, 1.0);
+    let (r, g) = if t < 0.5 { (2.0 * t, 1.0) } else { (1.0, 2.0 - 2.0 * t) };
+    Color32::from_rgb((70.0 + 185.0 * r) as u8, (70.0 + 150.0 * g) as u8, 70)
 }
 
 fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
@@ -890,6 +997,13 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
                     });
                 }
                 ui.checkbox(&mut s.optimize_lens, "Calibrate distortion from the photos");
+                if cfg!(feature = "ml") {
+                    ui.checkbox(&mut s.learned, "Learned matching for difficult photos").on_hover_text(
+                        "When ordinary feature matching leaves photos unconnected (sky, snow, walls, repeated patterns), \
+                         a neural matcher (RaCo-ALIKED + LightGlue) tries again. Its models (65 MB) download once, \
+                         the first time they are needed.",
+                    );
+                }
                 if let Some(p) = &s.project {
                     for (i, l) in p.lenses.iter().enumerate() {
                         let source = s.report.as_ref().and_then(|r| r.lens_source.get(i)).map(|src| match src {
@@ -946,7 +1060,65 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
                         if let Some(local) = r.and_then(|r| r.local).filter(|l| l.images_warped > 0 && p.output.local_alignment) {
                             stat(ui, "After local alignment", format!("{:.2} px", local.after));
                         }
+                        if let Some(d) = r.and_then(|r| r.dense.as_ref()).filter(|d| d.matches > 0) {
+                            let (med, p90) = if d.images_warped > 0 && p.output.local_alignment {
+                                (d.median_warped, d.p90_warped)
+                            } else {
+                                (d.median_after, d.p90_after)
+                            };
+                            stat(ui, "Overlap check", format!("{med:.2} px"))
+                                .on_hover_text(format!(
+                                    "Every overlap measured densely ({} measurements in {} pairs): the same detail lands \
+                                     {med:.2} px apart in neighbouring photos at the median, under {p90:.1} px for 90 % of them. \
+                                     Parallax from hand-holding shows up here; local warps correct it{}.",
+                                    d.matches,
+                                    d.pairs,
+                                    if d.images_warped > 0 { format!(" (applied to {} photos)", d.images_warped) } else { String::new() }
+                                ));
+                        }
+                        if let Some(r) = r {
+                            let learned = r.pairs.iter().filter(|p| p.learned).count();
+                            if learned > 0 {
+                                stat(ui, "Learned matcher", format!("{learned} pairs"))
+                                    .on_hover_text("Pairs ordinary feature matching could not connect, found by the neural matcher");
+                            }
+                            if !r.estimated.is_empty() {
+                                stat(ui, "From shooting pattern", format!("{} photos", r.estimated.len()))
+                                    .on_hover_text("Photos with nothing to match (clear sky, blank walls), placed between their neighbours");
+                            }
+                            if let Some(ph) = &r.photometric {
+                                stat(ui, "Exposure match", ph.short());
+                            }
+                        }
                     });
+                    // The weakest links, so a problem is easy to find.
+                    let mut weakest: Vec<((u32, u32), f32, usize)> = {
+                        let mut per: std::collections::HashMap<(u32, u32), Vec<f32>> = Default::default();
+                        for c in &p.control_points {
+                            per.entry((c.a, c.b)).or_default().push(c.error);
+                        }
+                        per.into_iter()
+                            .map(|(k, mut v)| {
+                                let n = v.len();
+                                let m = n / 2;
+                                v.select_nth_unstable_by(m, |a, b| a.total_cmp(b));
+                                (k, v[m], n)
+                            })
+                            .filter(|w| w.1 > 2.0 || w.2 < 8)
+                            .collect()
+                    };
+                    weakest.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    if !weakest.is_empty() {
+                        ui.label(RichText::new("Weakest links").color(theme::MUTED).small());
+                        for ((a, b), med, n) in weakest.iter().take(3) {
+                            let name = |i: u32| s.photos.get(i as usize).map(|p| p.name.as_str()).unwrap_or("?");
+                            ui.label(
+                                RichText::new(format!("{} – {}: {med:.1} px over {n} points", name(*a), name(*b)))
+                                    .color(heat_colour(*med))
+                                    .small(),
+                            );
+                        }
+                    }
                     let unaligned = p.images.iter().filter(|i| !i.aligned).count();
                     if unaligned > 0 {
                         ui.label(
@@ -991,10 +1163,18 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
                     .on_hover_text("Crop a partial panorama to a clean rectangle")
                     .changed();
                 let mut fill = p.output.pole_fill == PoleFill::Auto;
-                if ui.checkbox(&mut fill, "Patch zenith and nadir gaps").changed() {
+                if ui
+                    .checkbox(&mut fill, "Fill voids")
+                    .on_hover_text("Patch the zenith, the nadir and any holes between photos. Off leaves them empty (transparent in TIFF, PNG and PSD).")
+                    .changed()
+                {
                     p.output.pole_fill = if fill { PoleFill::Auto } else { PoleFill::Off };
                     changed = true;
                 }
+                changed |= ui
+                    .checkbox(&mut p.output.vignetting_correction, "Correct vignetting")
+                    .on_hover_text("Brighten the corners using the lens falloff measured in the overlaps")
+                    .changed();
                 if fill {
                     ui.spacing_mut().slider_width = ui.available_width() - 150.0;
                     for (value, label, tip) in [
@@ -1053,8 +1233,13 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
                     ui.add(egui::DragValue::new(&mut s.custom_width).range(512..=65536).speed(16).suffix(" px wide"));
                 }
                 ui.horizontal(|ui| {
-                    for (f, label) in [(Format::Jpeg, "JPEG"), (Format::Tiff, "TIFF"), (Format::Png, "PNG")] {
-                        ui.selectable_value(&mut s.format, f, label);
+                    for (f, label, tip) in [
+                        (Format::Jpeg, "JPEG", "8-bit"),
+                        (Format::Tiff, "TIFF", "16-bit, keeps transparency"),
+                        (Format::Png, "PNG", "16-bit, keeps transparency"),
+                        (Format::Psd, "PSD", "16-bit Photoshop (PSB when very large)"),
+                    ] {
+                        ui.selectable_value(&mut s.format, f, label).on_hover_text(tip);
                     }
                 });
                 if s.format == Format::Jpeg {
@@ -1159,7 +1344,7 @@ fn centre(app: &mut NodalApp, ui: &mut Ui) {
                 ui.horizontal(|ui| {
                     icons::center_row(ui, &["Choose photos…"]);
                     if icons::pill(ui, Icon::Plus, "Choose photos…", true).clicked() {
-                        if let Some(files) = rfd::FileDialog::new().add_filter("Photos", &["jpg", "jpeg", "png", "tif", "tiff", "webp"]).pick_files() {
+                        if let Some(files) = rfd::FileDialog::new().add_filter("Photos and RAW", nodal_stitch::decode::EXTENSIONS).pick_files() {
                             s.add_photos(&ctx, files);
                         }
                     }
@@ -1230,6 +1415,11 @@ fn centre(app: &mut NodalApp, ui: &mut Ui) {
                 }
             }
         }
+        if s.heat && !moving {
+            if let Some(p) = &s.project {
+                draw_heat(p, &painter, img, &prev.window, prev.full_sphere);
+            }
+        }
         if resp.drag_stopped() {
             // Apply the drag as a rotation of the whole panorama.
             let (yaw, pitch) =
@@ -1263,6 +1453,13 @@ fn centre(app: &mut NodalApp, ui: &mut Ui) {
         ui.scope_builder(egui::UiBuilder::new().max_rect(g), |ui| {
             ui.toggle_value(&mut s.grid, "Grid");
         });
+        let h = Rect::from_min_size(pos2(img.right() - 172.0, img.bottom() + 6.0), vec2(104.0, 24.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(h), |ui| {
+            ui.toggle_value(&mut s.heat, "Heat map").on_hover_text(
+                "Control point residuals on the panorama: green under 1 px, red above 4 px. Red clusters mark \
+                 parallax, movement or a wrong match.",
+            );
+        });
     } else if !s.photos.is_empty() {
         // Contact sheet while there is no panorama yet.
         let n = s.photos.len();
@@ -1281,6 +1478,8 @@ fn centre(app: &mut NodalApp, ui: &mut Ui) {
             egui::Image::new(&photo.thumb).corner_radius(6).paint_at(ui, Rect::from_center_size(r.center(), ts * k));
         }
     }
+
+    mask_window(s, &ctx);
 
     // Progress and errors float over the centre.
     if let Some(title) = s.job {
@@ -1309,5 +1508,115 @@ fn centre(app: &mut NodalApp, ui: &mut Ui) {
             });
             ui.label(RichText::new(err).color(theme::TEXT).small());
         });
+    }
+}
+
+/// Control point residuals drawn where they sit in the panorama.
+fn draw_heat(p: &Project, painter: &egui::Painter, img: Rect, window: &[f32; 4], full_sphere: bool) {
+    let models: Vec<nodal_stitch::lens::LensModel> = p.lenses.iter().map(|l| l.model()).collect();
+    let rots: Vec<Rotation3<f64>> = p.images.iter().map(|i| i.rot()).collect();
+    let step = (p.control_points.len() / 4000).max(1);
+    for cp in p.control_points.iter().step_by(step) {
+        let a = cp.a as usize;
+        if !p.images[a].aligned {
+            continue;
+        }
+        let d = rots[a] * models[p.images[a].lens].pixel_to_ray(cp.ax as f64, cp.ay as f64);
+        let yaw = d.x.atan2(d.z) as f32;
+        let pitch = d.y.clamp(-1.0, 1.0).asin() as f32;
+        let mut u = (yaw - window[0]) / window[1];
+        if full_sphere {
+            u = u.rem_euclid(1.0);
+        }
+        let v = (window[2] - pitch) / window[3];
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            continue;
+        }
+        let at = pos2(img.left() + u * img.width(), img.top() + v * img.height());
+        painter.circle_filled(at, if cp.error > 2.0 { 2.6 } else { 1.6 }, heat_colour(cp.error));
+    }
+}
+
+/// The mask painter: drag to leave parts of a photo out (people, a tripod leg, your shadow);
+/// right-drag or Shift-drag to bring them back.
+fn mask_window(s: &mut Stitcher, ctx: &egui::Context) {
+    let Some(ed) = &mut s.mask_editor else { return };
+    let name = s.photos.get(ed.photo).map(|p| p.name.clone()).unwrap_or_default();
+    let mut open = true;
+    let mut action: Option<bool> = None; // Some(true) = apply, Some(false) = cancel
+    egui::Window::new(format!("Mask · {name}")).open(&mut open).collapsible(false).resizable(true).default_width(680.0).show(ctx, |ui| {
+        ui.label(
+            RichText::new("Paint over anything that should not appear: moving people, a tripod leg, your shadow. Right-drag to erase.")
+                .color(theme::MUTED)
+                .small(),
+        );
+        let ts = ed.tex.size_vec2();
+        let avail = ui.available_width().max(200.0);
+        let k = (avail / ts.x).min(520.0 / ts.y);
+        let (rect, resp) = ui.allocate_exact_size(ts * k, Sense::click_and_drag());
+        ui.painter().image(ed.tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        // Masked cells.
+        let (cw, chh) = (rect.width() / ed.w as f32, rect.height() / ed.h as f32);
+        for y in 0..ed.h {
+            let mut x = 0;
+            while x < ed.w {
+                if !ed.bits[y * ed.w + x] {
+                    x += 1;
+                    continue;
+                }
+                let x0 = x;
+                while x < ed.w && ed.bits[y * ed.w + x] {
+                    x += 1;
+                }
+                let r = Rect::from_min_size(rect.min + vec2(x0 as f32 * cw, y as f32 * chh), vec2((x - x0) as f32 * cw, chh));
+                ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(230, 60, 60, 110));
+            }
+        }
+        if let Some(pos) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) {
+            let r = ed.brush * cw;
+            ui.painter().circle_stroke(pos, r, Stroke::new(1.0, Color32::WHITE));
+            let erase = ui.input(|i| i.pointer.secondary_down() || i.modifiers.shift);
+            if resp.dragged() || resp.clicked() || resp.secondary_clicked() {
+                let (mx, my) = ((pos.x - rect.left()) / cw, (pos.y - rect.top()) / chh);
+                let b = ed.brush;
+                for y in ((my - b).floor().max(0.0) as usize)..((my + b).ceil().min(ed.h as f32) as usize) {
+                    for x in ((mx - b).floor().max(0.0) as usize)..((mx + b).ceil().min(ed.w as f32) as usize) {
+                        if (x as f32 + 0.5 - mx).powi(2) + (y as f32 + 0.5 - my).powi(2) <= b * b {
+                            ed.bits[y * ed.w + x] = !erase;
+                        }
+                    }
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Brush").color(theme::MUTED));
+            ui.add(egui::Slider::new(&mut ed.brush, 1.0..=30.0).show_value(false));
+            if ui.button("Clear").clicked() {
+                ed.bits.iter_mut().for_each(|b| *b = false);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new("Apply").strong()).clicked() {
+                    action = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    action = Some(false);
+                }
+            });
+        });
+    });
+    if !open {
+        action = Some(false);
+    }
+    match action {
+        Some(true) => {
+            let ed = s.mask_editor.take().unwrap();
+            if let Some(p) = &mut s.project {
+                p.images[ed.photo].mask =
+                    ed.bits.iter().any(|b| *b).then(|| nodal_stitch::project::ImageMask::from_bits(ed.w as u32, ed.h as u32, &ed.bits));
+            }
+            s.request_preview(ctx);
+        }
+        Some(false) => s.mask_editor = None,
+        None => {}
     }
 }
