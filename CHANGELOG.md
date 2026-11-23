@@ -39,6 +39,7 @@ ground truth instead of trusted.
 
 ### Changed
 
+- The Mac app needs macOS 13.4 or later (the learned matcher's ONNX Runtime is built for it)
 - Lens calibration stages are kept only when they lower the error on held-out control points
 - Full-resolution photos are streamed from disk during rendering; RAWs are decoded at half size when
   the output cannot use more
