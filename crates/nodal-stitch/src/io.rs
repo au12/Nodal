@@ -189,7 +189,7 @@ fn build_srgb_icc() -> Vec<u8> {
     let mut data = Vec::new();
     let mut trc_at = (0u32, 0u32);
     for (sig, block) in &blocks {
-        while (offset + data.len()) % 4 != 0 {
+        while !(offset + data.len()).is_multiple_of(4) {
             data.push(0);
         }
         let at = (offset + data.len()) as u32;
@@ -201,7 +201,7 @@ fn build_srgb_icc() -> Vec<u8> {
     }
     table.push((*b"gTRC", trc_at.0, trc_at.1));
     table.push((*b"bTRC", trc_at.0, trc_at.1));
-    while (offset + data.len()) % 4 != 0 {
+    while !(offset + data.len()).is_multiple_of(4) {
         data.push(0);
     }
     offset += data.len();
@@ -236,23 +236,6 @@ fn build_srgb_icc() -> Vec<u8> {
     out.extend_from_slice(&data);
     debug_assert_eq!(out.len(), size as usize);
     out
-}
-
-#[cfg(test)]
-mod icc_tests {
-    #[test]
-    fn srgb_profile_parses_and_round_trips() {
-        let icc = super::srgb_icc();
-        let p = moxcms::ColorProfile::new_from_slice(&icc).expect("valid ICC");
-        let dst = moxcms::ColorProfile::new_srgb();
-        let xf = p.create_transform_8bit(moxcms::Layout::Rgb, &dst, moxcms::Layout::Rgb, Default::default()).unwrap();
-        let src = [10u8, 128, 250, 0, 255, 77];
-        let mut out = [0u8; 6];
-        xf.transform(&src, &mut out).unwrap();
-        for (a, b) in src.iter().zip(&out) {
-            assert!((*a as i32 - *b as i32).abs() <= 2, "{src:?} -> {out:?}");
-        }
-    }
 }
 
 /// 16-bit samples, RGB or RGBA (alpha where the panorama has voids).
@@ -334,12 +317,21 @@ fn save_png16(pano: &crate::render::Panorama, path: &Path) -> Result<()> {
     let (data, alpha) = samples16(pano);
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_be_bytes()).collect();
     let file = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(path)?);
-    let mut enc = image::codecs::png::PngEncoder::new_with_quality(file, image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::Adaptive);
+    let mut enc = image::codecs::png::PngEncoder::new_with_quality(
+        file,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::Adaptive,
+    );
     let _ = enc.set_icc_profile(srgb_icc());
     // The image crate expects native-endian u16 bytes for 16-bit buffers.
     let native: Vec<u8> = data.iter().flat_map(|v| v.to_ne_bytes()).collect();
     drop(bytes);
-    enc.write_image(&native, pano.width as u32, pano.height as u32, if alpha { image::ExtendedColorType::Rgba16 } else { image::ExtendedColorType::Rgb16 })?;
+    enc.write_image(
+        &native,
+        pano.width as u32,
+        pano.height as u32,
+        if alpha { image::ExtendedColorType::Rgba16 } else { image::ExtendedColorType::Rgb16 },
+    )?;
     Ok(())
 }
 
@@ -362,4 +354,21 @@ pub fn save_panorama(pano: &crate::render::Panorama, path: &Path, quality: u8) -
         other => anyhow::bail!("unsupported output format \".{other}\" (use .jpg, .tif, .png or .psd)"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod icc_tests {
+    #[test]
+    fn srgb_profile_parses_and_round_trips() {
+        let icc = super::srgb_icc();
+        let p = moxcms::ColorProfile::new_from_slice(&icc).expect("valid ICC");
+        let dst = moxcms::ColorProfile::new_srgb();
+        let xf = p.create_transform_8bit(moxcms::Layout::Rgb, &dst, moxcms::Layout::Rgb, Default::default()).unwrap();
+        let src = [10u8, 128, 250, 0, 255, 77];
+        let mut out = [0u8; 6];
+        xf.transform(&src, &mut out).unwrap();
+        for (a, b) in src.iter().zip(&out) {
+            assert!((*a as i32 - *b as i32).abs() <= 2, "{src:?} -> {out:?}");
+        }
+    }
 }

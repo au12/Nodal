@@ -12,6 +12,9 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// A warped photo strip ready for blending: (x0, y0, width, height, layer).
+type PlacedLayer = (i64, i64, usize, usize, Layer);
+
 #[derive(Clone, Debug)]
 pub struct RenderOptions {
     /// Output width in pixels for the full 360°; 0 uses the project's setting or the native size.
@@ -396,8 +399,7 @@ pub fn render(project: &Project, pixels: &dyn PixelProvider, opts: &RenderOption
     for &i in &active {
         stats.gains[i] = proj.images[i].gain;
     }
-    let working: Vec<Option<Arc<RgbImage>>> =
-        (0..proj.images.len()).map(|i| active.contains(&i).then(|| pixels.working(i))).collect();
+    let working: Vec<Option<Arc<RgbImage>>> = (0..proj.images.len()).map(|i| active.contains(&i).then(|| pixels.working(i))).collect();
 
     // ---- Reduced-size pass: seams ------------------------------------------------------------
     progress(0.0, "Analysing overlaps");
@@ -570,7 +572,7 @@ pub fn render(project: &Project, pixels: &dyn PixelProvider, opts: &RenderOption
         let current = next.take();
         let following = order.get(n + 1).map(|&(_, j)| j);
         let work = working[i].clone().expect("active image");
-        let (layers_done, prefetched) = std::thread::scope(|scope| -> Result<(Vec<(i64, i64, usize, usize, Layer)>, Option<Arc<LinearImage>>)> {
+        let (layers_done, prefetched) = std::thread::scope(|scope| -> Result<(Vec<PlacedLayer>, Option<Arc<LinearImage>>)> {
             let handle = following.map(|j| scope.spawn(move || load(j)));
             let src = match &current {
                 Some(full) => SourcePixels::Linear(full),
@@ -588,7 +590,8 @@ pub fn render(project: &Project, pixels: &dyn PixelProvider, opts: &RenderOption
             let mut out = Vec::new();
             for (bx0, bx1) in spans {
                 let (lw_px, lh_px) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
-                let mut layer = warper.render(&canvas, Roi { x0: bx0 + origin_x, y0: by0 + origin_y, w: lw_px, h: lh_px }, opts.filter, false);
+                let mut layer =
+                    warper.render(&canvas, Roi { x0: bx0 + origin_x, y0: by0 + origin_y, w: lw_px, h: lh_px }, opts.filter, false);
                 layer.rgb.par_chunks_mut(4096).for_each(|c| c.iter_mut().for_each(|v| *v = pixels::to_perceptual_fast(*v)));
                 out.push((bx0, by0, lw_px, lh_px, layer));
             }
@@ -609,21 +612,23 @@ pub fn render(project: &Project, pixels: &dyn PixelProvider, opts: &RenderOption
                 if gm.iter().any(|g| *g) {
                     let roi = layer.roi;
                     let f = lw as f64 / canvas.w as f64;
-                    layer.alpha.par_chunks_mut(roi.w).zip(layer.rgb.par_chunks_mut(roi.w * 3)).enumerate().for_each(|(ly, (arow, crow))| {
-                        let cy = ((roi.y0 + ly as i64) as f64 + 0.5) * f;
-                        let gy = cy as i64 - groi.y0;
-                        if gy < 0 || gy as usize >= groi.h {
-                            return;
-                        }
-                        for lx in 0..roi.w {
-                            let cx = ((roi.x0 + lx as i64) as f64 + 0.5) * f;
-                            let gx = (cx as i64 - groi.x0).rem_euclid(lw as i64) as usize;
-                            if gx < groi.w && gm[gy as usize * groi.w + gx] {
-                                arow[lx] = 0;
-                                crow[lx * 3..lx * 3 + 3].fill(0.0);
+                    layer.alpha.par_chunks_mut(roi.w).zip(layer.rgb.par_chunks_mut(roi.w * 3)).enumerate().for_each(
+                        |(ly, (arow, crow))| {
+                            let cy = ((roi.y0 + ly as i64) as f64 + 0.5) * f;
+                            let gy = cy as i64 - groi.y0;
+                            if gy < 0 || gy as usize >= groi.h {
+                                return;
                             }
-                        }
-                    });
+                            for lx in 0..roi.w {
+                                let cx = ((roi.x0 + lx as i64) as f64 + 0.5) * f;
+                                let gx = (cx as i64 - groi.x0).rem_euclid(lw as i64) as usize;
+                                if gx < groi.w && gm[gy as usize * groi.w + gx] {
+                                    arow[lx] = 0;
+                                    crow[lx * 3..lx * 3 + 3].fill(0.0);
+                                }
+                            }
+                        },
+                    );
                 }
             }
             let mask = layer_mask(&layer, &canvas, &labels, lw, lh, k as u16);

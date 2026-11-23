@@ -290,7 +290,7 @@ pub fn write(path: &Path, w: usize, h: usize, channels: usize, depth: u16, inter
     f.write_all(&depth.to_be_bytes())?;
     f.write_all(&(if channels >= 3 { 3u16 } else { 1 }).to_be_bytes())?;
     f.write_all(&0u32.to_be_bytes())?; // colour mode data
-    // Image resources.
+                                       // Image resources.
     let mut res = Vec::new();
     if let Some(icc) = icc {
         res.extend_from_slice(b"8BIM");

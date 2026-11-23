@@ -1417,7 +1417,8 @@ pub fn fill_holes(pano: &mut Panorama, opts: &FillOptions, progress: Progress) -
             continue;
         }
         // Angular centre and radius.
-        let dirs: Vec<V3> = cells.iter().map(|&c| pano_dir(pano, ((c % gw) * k) as f64 + k as f64 * 0.5, ((c / gw) * k) as f64 + k as f64 * 0.5)).collect();
+        let dirs: Vec<V3> =
+            cells.iter().map(|&c| pano_dir(pano, ((c % gw) * k) as f64 + k as f64 * 0.5, ((c / gw) * k) as f64 + k as f64 * 0.5)).collect();
         let centre = dirs.iter().sum::<V3>().normalize();
         let cell_angle = k as f64 * TAU / pano.full_width as f64;
         let radius = dirs.iter().map(|d| crate::global::vec_angle(d, &centre)).fold(0.0f64, f64::max) + cell_angle;
@@ -1435,7 +1436,8 @@ pub fn fill_holes(pano: &mut Panorama, opts: &FillOptions, progress: Progress) -
             filled += 1;
             continue;
         }
-        let axis = nalgebra::Rotation3::rotation_between(&centre, &V3::y()).unwrap_or_else(|| nalgebra::Rotation3::from_axis_angle(&V3::x_axis(), PI));
+        let axis = nalgebra::Rotation3::rotation_between(&centre, &V3::y())
+            .unwrap_or_else(|| nalgebra::Rotation3::from_axis_angle(&V3::x_axis(), PI));
         let cap = Cap { axis, top: true, sky: centre.y > 0.1, gap_deg: radius.to_degrees() as f32, forced: false };
         if let Some(syn) = synthesise(pano, &cap, opts) {
             apply(pano, &syn, cap.gap_deg);

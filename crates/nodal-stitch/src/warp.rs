@@ -6,8 +6,8 @@
 //! remapping several times faster than evaluating trigonometry per pixel without visible loss.
 
 use crate::lens::{LensModel, V3};
-use crate::project::{OutputProjection, Project, WarpField};
 use crate::pixels::LinearImage;
+use crate::project::{OutputProjection, Project, WarpField};
 use image::RgbImage;
 use nalgebra::Rotation3;
 use rayon::prelude::*;

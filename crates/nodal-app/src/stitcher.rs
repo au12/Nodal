@@ -105,6 +105,8 @@ pub struct Stitcher {
     lens_mode: LensMode,
     lens_fov: f64,
     optimize_lens: bool,
+    /// Learned matcher for photos SIFT cannot connect (downloads its models once).
+    learned: bool,
     width_choice: usize,
     custom_width: u32,
     format: Format,
@@ -153,6 +155,7 @@ impl Default for Stitcher {
             lens_mode: LensMode::Auto,
             lens_fov: 0.0,
             optimize_lens: true,
+            learned: true,
             width_choice: 0,
             custom_width: 8192,
             format: Format::Jpeg,
@@ -254,7 +257,13 @@ impl Stitcher {
             (LensMode::Rectilinear, f) => Some((LensKind::Rectilinear, f)),
             (LensMode::Fisheye, f) => Some((LensKind::Fisheye, f)),
         };
-        AlignOptions { lens, optimize_lens: self.optimize_lens, ..Default::default() }
+        #[allow(unused_mut)]
+        let mut opts = AlignOptions { lens, optimize_lens: self.optimize_lens, ..Default::default() };
+        #[cfg(feature = "ml")]
+        if self.learned {
+            opts.rescue = Some(nodal_stitch::align::RescueHandle(std::sync::Arc::new(nodal_stitch::ml::SourceRescue::new(&self.sources))));
+        }
+        opts
     }
 
     fn align(&mut self, ctx: &egui::Context) {
@@ -890,6 +899,13 @@ fn settings_panel(app: &mut NodalApp, ui: &mut Ui) {
                     });
                 }
                 ui.checkbox(&mut s.optimize_lens, "Calibrate distortion from the photos");
+                if cfg!(feature = "ml") {
+                    ui.checkbox(&mut s.learned, "Learned matching for difficult photos").on_hover_text(
+                        "When ordinary feature matching leaves photos unconnected (sky, snow, walls, repeated patterns), \
+                         a neural matcher (RaCo-ALIKED + LightGlue) tries again. Its models (65 MB) download once, \
+                         the first time they are needed.",
+                    );
+                }
                 if let Some(p) = &s.project {
                     for (i, l) in p.lenses.iter().enumerate() {
                         let source = s.report.as_ref().and_then(|r| r.lens_source.get(i)).map(|src| match src {
