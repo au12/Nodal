@@ -40,19 +40,32 @@ plan will change as real use shows what matters. Ideas and requests are welcome 
 - [x] **GPano metadata** written by the stitcher and read by the tiler
 - [x] **Project files** (`.nodal`): save a stitch and reopen it later with its alignment intact
 
-## ⏳ 0.3: Stitching, deeper
+## 🚧 0.3: Stitching, deeper
 
-- [ ] **Mask painting.** Mark areas to keep or exclude (people, the tripod, your own shadow)
-- [ ] **Control point editor.** See, add and remove points on the photos
-- [ ] **Exposure brackets and HDR.** Merge bracketed shots and blend with exposure fusion
-- [ ] **RAW input** and a 16-bit pipeline with 16-bit TIFF output
+- [x] **RAW input** (FlashRaw), TIFF/BigTIFF and PSD/PSB, a scene-linear float pipeline and 16-bit
+      TIFF, PNG and PSD output
+- [x] **Fisheye projection calibration** (equidistant, equisolid, stereographic and in between),
+      with every lens parameter gated on held-out control points
+- [x] **Rotation averaging** with cycle checks and ring-closing focal search
+- [x] **Learned rescue matching** (RaCo-ALIKED + LightGlue) for photos SIFT cannot connect
+- [x] **Featureless photos** placed from the shooting pattern
+- [x] **Dense overlap registration,** a second adjustment and parallax warps
+- [x] **Exposure, white balance and vignetting** solved jointly; ghost masks for moving people
+- [x] **Void filling** anywhere in the panorama, with an off switch
+- [x] **Mask painting** and a residual heat map in the workspace
+- [x] **Streaming photos from disk** while rendering, half-size RAW decode for smaller outputs
+- [x] **Accuracy suite** (`nodal bench --suite`) scored against ground truth
+- [ ] **GPU warp and blend,** tiled so memory stays flat for gigapixel output
+- [ ] **Global multi-label seams** (one labelling over all photos) and pole caps blended in
+      pole-centred views
+- [ ] **Exposure brackets and HDR.** Merge bracketed shots per viewpoint, blend once
+- [ ] **Viewpoint correction** for hand-held nadir shots, a tripod auto-mask and LaMa-guided patches
+      for structured ceilings
+- [ ] **Core ML acceleration** for the learned matcher on Apple Silicon
+- [ ] **Control point editor** on the photos themselves (add and drag points)
 - [ ] **Circular fisheye** crop detection, and per-photo lens parameters for mixed sets
-- [ ] **Viewpoint correction** for handheld nadir shots
 - [ ] **More output projections:** cylindrical, rectilinear and little-planet stills from the stitcher
-- [ ] **Faster rendering.** GPU blending, tight full-resolution regions per photo, and streaming
-      photos from disk so very large sets fit in memory
 - [ ] **Stitching in the web and Docker UI:** upload a photo set and stitch it on the server
-- [ ] **Better patches for structured ceilings** and other hard cases overhead
 
 ## ⏳ 0.4: Distribution and polish
 
@@ -109,7 +122,7 @@ plan will change as real use shows what matters. Ideas and requests are welcome 
   aren't wired up yet.
 - The server has **one shared token**, with no per-user accounts yet.
 - On **Windows** the `.exe` is also the command-line tool, so a console window opens alongside the app.
-- **Stitching** runs in the native app and CLI only, on 8-bit photos, with the whole set in memory.
+- **Stitching** runs in the native app and CLI only, on the CPU. Exposure brackets are not merged yet.
 - **Pole patches** are synthesised: complex structure directly overhead can look invented.
 
 ## Not planned
