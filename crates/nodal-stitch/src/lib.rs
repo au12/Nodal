@@ -363,7 +363,13 @@ pub fn align_sources(sources: &[Source], opts: &AlignOptions, progress: Progress
         progress(0.7, "Measuring overlaps");
         let dense_report = dense::refine_project(&mut project, sources, opts, &|f, s| progress(0.7 + 0.2 * f, s));
         report.log.extend(dense_report.log.iter().cloned());
-        report.rms = dense_report.rms_after.max(0.0);
+        // The report's RMS / max describe the control points (the dense figures, which include
+        // near-content parallax, are reported on their own).
+        let lens_of: Vec<usize> = project.images.iter().map(|i| i.lens).collect();
+        let (rms, max) = optimize::error_stats(&project, &project.control_points, &lens_of);
+        report.rms = rms;
+        report.max = max;
+        report.control_points = project.control_points.len();
         report.dense = Some(dense_report);
     } else if project.output.local_alignment {
         let local = local::fit(&mut project);
