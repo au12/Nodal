@@ -413,7 +413,7 @@ On Linux the native app needs the usual windowing libraries (`libxkbcommon`, `li
 bump `version` in `Cargo.toml`, then push a tag:
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
 You can also create the tag from the **Releases** page (*Draft a new release* → new tag → *Publish*).

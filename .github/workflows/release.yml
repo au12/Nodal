@@ -4,7 +4,7 @@ name: Release
 # Windows and the macOS app (via macos.yml), then publishes one release with notes from
 # CHANGELOG.md, every binary and SHA256SUMS.txt. docker.yml publishes the matching image tags.
 #
-#   git tag v0.2.0 && git push origin v0.2.0
+#   git tag v0.3.0 && git push origin v0.3.0
 
 on:
   push:

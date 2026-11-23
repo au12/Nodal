@@ -9,7 +9,7 @@
 
 `SHA256SUMS.txt` lists checksums for every file.
 
-**macOS.** Open the disk image and drag Nodal to Applications. If macOS says it can't verify the app (builds without a Developer ID are ad-hoc signed), choose **Done**, then go to **System Settings → Privacy & Security → Open Anyway**. On macOS 14 and earlier, right-click the app and choose **Open**. Or run `xattr -dr com.apple.quarantine /Applications/Nodal.app`.
+**macOS** (Apple Silicon, macOS 13.4 or later). Open the disk image and drag Nodal to Applications. If macOS says it can't verify the app (builds without a Developer ID are ad-hoc signed), choose **Done**, then go to **System Settings → Privacy & Security → Open Anyway**. On macOS 14 and earlier, right-click the app and choose **Open**. Or run `xattr -dr com.apple.quarantine /Applications/Nodal.app`.
 
 **Docker**
 

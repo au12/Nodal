@@ -4,6 +4,8 @@ All notable changes to Nodal are documented here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-23
+
 The stitching engine, rebuilt. RAW in, 16-bit out, every photo placed, and alignment measured against
 ground truth instead of trusted.
 
@@ -53,6 +55,7 @@ ground truth instead of trusted.
 - The ring check behind the focal-length search failed when the reference photo pointed steeply up or
   down, and its clarity test was swamped by photos outside the group
 - Output ICC profiles were rejected by some readers (libpng warnings); they are now hand-built ICC v2
+- The Mac app failed to link ONNX Runtime's Core ML code (missing clang builtins)
 
 ## [0.2.0] - 2026-11-22
 
@@ -114,6 +117,7 @@ The first release of **Nodal**: a fast, GPU-accelerated 360° panorama viewer, t
 - The Mac build is ad-hoc signed rather than notarized and targets Apple Silicon only. It doesn't yet accept files dropped on the Dock icon or opened with Finder *Open With*; dropping onto the window works.
 - On Windows the `.exe` is also the command-line tool, so a console window opens alongside the app.
 
-[Unreleased]: https://github.com/au12/Nodal/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/au12/Nodal/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/au12/Nodal/releases/tag/v0.3.0
 [0.2.0]: https://github.com/au12/Nodal/releases/tag/v0.2.0
 [0.1.0]: https://github.com/au12/Nodal/releases/tag/v0.1.0
