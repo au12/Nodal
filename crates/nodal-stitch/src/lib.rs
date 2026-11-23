@@ -20,6 +20,8 @@ pub mod io;
 pub mod lens;
 pub mod local;
 pub mod matching;
+#[cfg(feature = "ml")]
+pub mod ml;
 pub mod optimize;
 pub mod photometric;
 pub mod pixels;
@@ -168,7 +170,8 @@ pub fn load_sources_with(
             .par_iter()
             .zip(infos.par_iter())
             .map(|(path, info)| {
-                let (work, _) = decode::decode_linear(path, &settings).map_err(|e| e.context(format!("could not load {}", path.display())))?;
+                let (work, _) =
+                    decode::decode_linear(path, &settings).map_err(|e| e.context(format!("could not load {}", path.display())))?;
                 let work = work.to_srgb8(1.0);
                 let features = detect_scaled(&work, info.width, detect);
                 let k = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -313,8 +316,10 @@ pub fn align_sources(sources: &[Source], opts: &AlignOptions, progress: Progress
     let mut report = align::align(&mut project, &feats, &AlignOptions { level: false, ..opts.clone() }, &|f, s| progress(f * 0.6, s))?;
     lap(&mut report, "match + global alignment");
     // Polish control points on the working copies, then re-optimise with the sharper measurements.
-    // Dense registration supersedes this (it measures sub-pixel correspondences everywhere).
-    if project.control_points.len() >= 12 && !opts.dense {
+    // Detector positions carry several pixels of noise on large frames; dense registration needs a
+    // sub-pixel model to start from (it measures against the current model, so a rough start biases
+    // what it sees).
+    if project.control_points.len() >= 12 {
         let lumas: Vec<refine::Luma> = sources.par_iter().map(|s| refine::Luma::from_rgb_scaled(&s.image, s.work_scale())).collect();
         progress(0.62, "Refining control points");
         let before = report.rms;

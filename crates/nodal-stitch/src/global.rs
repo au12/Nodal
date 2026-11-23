@@ -282,12 +282,22 @@ pub struct PairPoints {
 
 /// Robust global cost of a lens hypothesis: pairwise rotations from the inliers, averaged, then
 /// the reprojection error of every inlier under the averaged rotations (Cauchy loss, pixels).
-pub fn consistency_cost(n: usize, pairs: &[PairPoints], models: &[LensModel], lens_of: &[usize], anchor: usize) -> (f64, Vec<Option<Rotation3<f64>>>) {
+pub fn consistency_cost(
+    n: usize,
+    pairs: &[PairPoints],
+    models: &[LensModel],
+    lens_of: &[usize],
+    anchor: usize,
+) -> (f64, Vec<Option<Rotation3<f64>>>) {
     let edges: Vec<Edge> = pairs
         .iter()
         .filter_map(|p| {
             let (ma, mb) = (&models[lens_of[p.a]], &models[lens_of[p.b]]);
-            let rays: Vec<(V3, V3)> = p.pts.iter().map(|&(ax, ay, bx, by)| (ma.pixel_to_ray(ax as f64, ay as f64), mb.pixel_to_ray(bx as f64, by as f64))).collect();
+            let rays: Vec<(V3, V3)> = p
+                .pts
+                .iter()
+                .map(|&(ax, ay, bx, by)| (ma.pixel_to_ray(ax as f64, ay as f64), mb.pixel_to_ray(bx as f64, by as f64)))
+                .collect();
             let r = crate::matching::kabsch(rays.iter().copied())?;
             Some(Edge { a: p.a, b: p.b, r, w: (p.pts.len() as f64).sqrt() })
         })
@@ -307,11 +317,15 @@ pub fn consistency_cost(n: usize, pairs: &[PairPoints], models: &[LensModel], le
             count += 1;
         }
     }
-    // Images left out of the main component count as maximal cost.
+    // Images left out of the main component count as maximal cost. The penalty is kept apart
+    // from the mean so callers can judge how clear an optimum is from the mean alone.
     let placed = rots.iter().filter(|r| r.is_some()).count();
     let missing = n - placed;
-    (cost / count.max(1) as f64 + missing as f64 * 10.0, rots)
+    (cost / count.max(1) as f64 + missing as f64 * MISSING_COST, rots)
 }
+
+/// Penalty `consistency_cost` adds per photo outside the anchor's group.
+pub const MISSING_COST: f64 = 10.0;
 
 #[cfg(test)]
 mod tests {
@@ -321,7 +335,8 @@ mod tests {
     #[test]
     fn averaging_recovers_ring_and_rejects_bad_edge() {
         let n = 12;
-        let truth: Vec<Rotation3<f64>> = (0..n).map(|i| rotation_from_ypr(i as f64 * 30.0, if i % 2 == 0 { 5.0 } else { -5.0 }, 1.0)).collect();
+        let truth: Vec<Rotation3<f64>> =
+            (0..n).map(|i| rotation_from_ypr(i as f64 * 30.0, if i % 2 == 0 { 5.0 } else { -5.0 }, 1.0)).collect();
         let mut edges = Vec::new();
         for i in 0..n {
             for d in [1usize, 2] {

@@ -9,7 +9,9 @@ use crate::project::{ControlPoint, ExifInfo, Project, SourceImage};
 use crate::Progress;
 use nalgebra::{Matrix3, Rotation3, SymmetricEigen};
 use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct AlignOptions {
@@ -26,11 +28,51 @@ pub struct AlignOptions {
     /// Measure every overlap densely after the global alignment (second adjustment, local warps,
     /// parallax diagnostics).
     pub dense: bool,
+    /// Second matcher for photos the SIFT pass leaves unconnected.
+    pub rescue: Option<RescueHandle>,
 }
 
 impl Default for AlignOptions {
     fn default() -> Self {
-        AlignOptions { lens: None, quick_features: 900, ratio: 0.8, optimize_lens: true, level: true, max_points_per_pair: 400, dense: true }
+        AlignOptions {
+            lens: None,
+            quick_features: 900,
+            ratio: 0.8,
+            optimize_lens: true,
+            level: true,
+            max_points_per_pair: 400,
+            dense: true,
+            rescue: None,
+        }
+    }
+}
+
+/// A second matcher for photo pairs SIFT could not connect (low texture, repeated patterns, big
+/// exposure or viewpoint changes). `ml::SourceRescue` implements it with learned features.
+pub trait Rescue: Send + Sync {
+    fn name(&self) -> &str;
+    /// How likely each pair is to overlap (higher is likelier); used to choose which pairs to match.
+    fn affinity(&self, pairs: &[(usize, usize)], progress: &dyn Fn(f32, &str)) -> anyhow::Result<Vec<f32>>;
+    /// Correspondences for each pair, in full-resolution pixels. `thorough` asks for the slower,
+    /// stronger matcher (used for the pairs the fast one could not verify).
+    fn correspondences(&self, pairs: &[(usize, usize)], thorough: bool, progress: &dyn Fn(f32, &str))
+        -> anyhow::Result<Vec<RescueMatches>>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RescueMatches {
+    /// (ax, ay, bx, by) in full-resolution pixels.
+    pub pts: Vec<[f32; 4]>,
+    /// Typical localisation error in full-resolution pixels.
+    pub sigma: f32,
+}
+
+#[derive(Clone)]
+pub struct RescueHandle(pub Arc<dyn Rescue>);
+
+impl std::fmt::Debug for RescueHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Rescue({})", self.0.name())
     }
 }
 
@@ -40,6 +82,8 @@ pub struct PairStat {
     pub b: usize,
     pub matches: usize,
     pub inliers: usize,
+    /// Found by the learned rescue matcher rather than SIFT.
+    pub learned: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -129,6 +173,43 @@ struct Pair {
     a: usize,
     b: usize,
     raw: Vec<RawMatch>,
+}
+
+/// A verified overlap: the inlier correspondences (ax, ay, bx, by) in full-resolution pixels.
+struct Link {
+    a: usize,
+    b: usize,
+    matches: usize,
+    pts: Vec<[f32; 4]>,
+    learned: bool,
+}
+
+fn find_root(c: &mut [usize], i: usize) -> usize {
+    let mut r = i;
+    while c[r] != r {
+        r = c[r];
+    }
+    let mut j = i;
+    while c[j] != r {
+        let next = c[j];
+        c[j] = r;
+        j = next;
+    }
+    r
+}
+
+/// Connected-component label of every image.
+fn components(n: usize, edges: impl Iterator<Item = (usize, usize)>) -> Vec<usize> {
+    let mut comp: Vec<usize> = (0..n).collect();
+    for (a, b) in edges {
+        let (ra, rb) = (find_root(&mut comp, a), find_root(&mut comp, b));
+        comp[ra] = rb;
+    }
+    (0..n).map(|i| find_root(&mut comp, i)).collect()
+}
+
+fn count_groups(comp: &[usize]) -> usize {
+    comp.iter().enumerate().filter(|(i, c)| *i == **c).count()
 }
 
 fn feature_px(features: &[FeatureSet], img: usize) -> f64 {
@@ -239,6 +320,359 @@ fn estimate_lens(
     best
 }
 
+/// Learned matching between photos the SIFT pass left in separate groups. Tries capture-order
+/// neighbours and pairs SIFT half-matched first, then the pairs whose learned descriptors agree
+/// most, and keeps every pair a rotation explains.
+fn rescue_pass(
+    project: &Project,
+    models: &[LensModel],
+    links: &mut Vec<Link>,
+    rescue: &dyn Rescue,
+    quick: &[Pair],
+    report: &mut AlignReport,
+    progress: Progress,
+) {
+    let n = project.images.len();
+    // Capture order: EXIF time, then file name.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let (ia, ib) = (&project.images[a], &project.images[b]);
+        (ia.exif.taken.as_deref().unwrap_or(""), &ia.name, a).cmp(&(ib.exif.taken.as_deref().unwrap_or(""), &ib.name, b))
+    });
+    let mut pos = vec![0usize; n];
+    for (k, &i) in order.iter().enumerate() {
+        pos[i] = k;
+    }
+    let groups_before = count_groups(&components(n, links.iter().map(|l| (l.a, l.b))));
+    let mut tried: HashSet<(usize, usize)> = links.iter().map(|l| (l.a, l.b)).collect();
+    let mut affinity: HashMap<(usize, usize), f32> = HashMap::new();
+    let (mut attempted, mut added) = (0usize, 0usize);
+    for round in 0..4 {
+        let comp = components(n, links.iter().map(|l| (l.a, l.b)));
+        if count_groups(&comp) == 1 {
+            break;
+        }
+        let mut cands: Vec<(usize, usize)> = Vec::new();
+        let key = |a: usize, b: usize| (a.min(b), a.max(b));
+        if round == 0 {
+            for i in 0..n {
+                for d in 1..=2usize {
+                    for k in [pos[i].checked_sub(d), Some(pos[i] + d)].into_iter().flatten() {
+                        if let Some(&j) = order.get(k) {
+                            if comp[i] != comp[j] {
+                                cands.push(key(i, j));
+                            }
+                        }
+                    }
+                }
+            }
+            let mut hints: Vec<&Pair> = quick.iter().filter(|p| comp[p.a] != comp[p.b] && p.raw.len() >= 6).collect();
+            hints.sort_by_key(|p| std::cmp::Reverse(p.raw.len()));
+            cands.extend(hints.iter().take(2 * n).map(|p| key(p.a, p.b)));
+        } else {
+            let cross: Vec<(usize, usize)> = (0..n)
+                .flat_map(|a| (a + 1..n).map(move |b| (a, b)))
+                .filter(|&(a, b)| comp[a] != comp[b] && !tried.contains(&(a, b)) && !affinity.contains_key(&(a, b)))
+                .collect();
+            if !cross.is_empty() {
+                match rescue.affinity(&cross, &|f, s| progress(0.5 * f, s)) {
+                    Ok(v) => affinity.extend(cross.iter().copied().zip(v)),
+                    Err(e) => {
+                        report.log.push(format!("Learned matching unavailable: {e:#}"));
+                        return;
+                    }
+                }
+            }
+            // The best few untried partners of every photo outside the largest group, and the best
+            // links between every two groups.
+            let mut size: HashMap<usize, usize> = HashMap::new();
+            for &c in &comp {
+                *size.entry(c).or_default() += 1;
+            }
+            let main = *size.iter().max_by_key(|(c, s)| (**s, usize::MAX - **c)).unwrap().0;
+            let mut ranked: Vec<((usize, usize), f32)> =
+                affinity.iter().filter(|(p, &v)| comp[p.0] != comp[p.1] && !tried.contains(p) && v >= 8.0).map(|(p, v)| (*p, *v)).collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            let mut per_image = vec![0usize; n];
+            let mut per_groups: HashMap<(usize, usize), usize> = HashMap::new();
+            for &((a, b), _) in &ranked {
+                let g = (comp[a].min(comp[b]), comp[a].max(comp[b]));
+                let gi = per_groups.entry(g).or_default();
+                let outside = |i: usize| comp[i] != main && per_image[i] < 3;
+                if *gi < 3 || outside(a) || outside(b) {
+                    cands.push((a, b));
+                    *gi += 1;
+                    per_image[a] += 1;
+                    per_image[b] += 1;
+                }
+            }
+        }
+        cands.sort_unstable();
+        cands.dedup();
+        cands.retain(|p| !tried.contains(p));
+        cands.truncate(4 * n);
+        if cands.is_empty() {
+            if round == 0 {
+                continue;
+            }
+            break;
+        }
+        tried.extend(cands.iter().copied());
+        attempted += cands.len();
+        let new = rescue_match(project, models, rescue, &cands, None, report, &|f, s| progress(0.5 + 0.5 * f, s));
+        added += new.len();
+        links.extend(new);
+    }
+    links.sort_by_key(|l| (l.a, l.b));
+    let groups_after = count_groups(&components(n, links.iter().map(|l| (l.a, l.b))));
+    report.log.push(format!(
+        "{}: {added} of {attempted} tried pairs verified; groups of connected photos {groups_before} → {groups_after}",
+        rescue.name()
+    ));
+}
+
+/// Share of each photo's frame the other is predicted to cover (the smaller of the two).
+fn predicted_overlap(ma: &LensModel, mb: &LensModel, ra: &Rotation3<f64>, rb: &Rotation3<f64>) -> f64 {
+    let frac = |m1: &LensModel, m2: &LensModel, r12: Rotation3<f64>| {
+        const G: usize = 9;
+        let mut inside = 0;
+        for gy in 0..G {
+            for gx in 0..G {
+                let (x, y) = ((gx as f64 + 0.5) / G as f64 * m1.w, (gy as f64 + 0.5) / G as f64 * m1.h);
+                if let Some((px, py)) = m2.ray_to_pixel(r12 * m1.pixel_to_ray(x, y)) {
+                    if m2.contains(px, py) {
+                        inside += 1;
+                    }
+                }
+            }
+        }
+        inside as f64 / (G * G) as f64
+    };
+    frac(ma, mb, rb.inverse() * ra).min(frac(mb, ma, ra.inverse() * rb))
+}
+
+/// Matches pairs with the rescue matcher, fast tier first and the thorough tier for the pairs the
+/// fast one could not verify, and returns the verified links. `expect` gives the relative rotation
+/// the current layout predicts (camera b to camera a), which a link must agree with.
+fn rescue_match(
+    project: &Project,
+    models: &[LensModel],
+    rescue: &dyn Rescue,
+    pairs: &[(usize, usize)],
+    expect: Option<&(dyn Fn(usize, usize) -> Option<Rotation3<f64>> + Sync)>,
+    report: &mut AlignReport,
+    progress: Progress,
+) -> Vec<Link> {
+    let verify = |(a, b): (usize, usize), m: &RescueMatches| -> Option<Link> {
+        if m.pts.len() < 12 {
+            return None;
+        }
+        let (ma, mb) = (&models[project.images[a].lens], &models[project.images[b].lens]);
+        let rays: Vec<(V3, V3)> =
+            m.pts.iter().map(|p| (ma.pixel_to_ray(p[0] as f64, p[1] as f64), mb.pixel_to_ray(p[2] as f64, p[3] as f64))).collect();
+        // Learned keypoints are localised to about a pixel of the image the network saw; the lens may
+        // still be rough, so allow a small fraction of the frame as well.
+        let long = project.images[a].width.max(project.images[a].height) as f64;
+        let tol_px = (3.0 * m.sigma as f64).max(0.006 * long);
+        let fit = ransac_rotation(&rays, tol_px / ma.f.min(mb.f), (a * 7919 + b) as u64 ^ 0x5eed)?;
+        if std::env::var_os("NODAL_DEBUG_RESCUE").is_some() {
+            eprintln!("rescue {}-{}: {} matches, {} inliers (tol {tol_px:.1} px)", a + 1, b + 1, m.pts.len(), fit.inliers.len());
+        }
+        if fit.inliers.len() < 12 || fit.inliers.len() as f64 <= 6.0 + 0.22 * m.pts.len() as f64 {
+            return None;
+        }
+        // The inliers must cover some of the frame: a cluster on one small patch fixes nothing.
+        let (w, h) = (project.images[a].width as f32, project.images[a].height as f32);
+        let mut cells = [false; 64];
+        for &k in &fit.inliers {
+            let p = m.pts[k];
+            let (cx, cy) = (((p[0] / w * 8.0) as usize).min(7), ((p[1] / h * 8.0) as usize).min(7));
+            cells[cy * 8 + cx] = true;
+        }
+        if cells.iter().filter(|&&c| c).count() < 4 {
+            return None;
+        }
+        if let Some(r) = expect.and_then(|e| e(a, b)) {
+            if crate::global::rot_angle(&(fit.r.inverse() * r)) > 8f64.to_radians() {
+                return None;
+            }
+        }
+        Some(Link { a, b, matches: m.pts.len(), pts: fit.inliers.iter().map(|&k| m.pts[k]).collect(), learned: true })
+    };
+    let fast = match rescue.correspondences(pairs, false, &|f, s| progress(0.4 * f, s)) {
+        Ok(v) => v,
+        Err(e) => {
+            report.log.push(format!("Learned matching unavailable: {e:#}"));
+            return Vec::new();
+        }
+    };
+    let results: Vec<Option<Link>> = pairs.par_iter().zip(fast.par_iter()).map(|(&p, m)| verify(p, m)).collect();
+    let failed: Vec<(usize, usize)> = pairs.iter().zip(&results).filter(|(_, r)| r.is_none()).map(|(p, _)| *p).collect();
+    let mut out: Vec<Link> = results.into_iter().flatten().collect();
+    if !failed.is_empty() {
+        match rescue.correspondences(&failed, true, &|f, s| progress(0.4 + 0.6 * f, s)) {
+            Ok(v) => out.extend(failed.par_iter().zip(v.par_iter()).filter_map(|(&p, m)| verify(p, m)).collect::<Vec<_>>()),
+            Err(e) => report.log.push(format!("Learned matching unavailable: {e:#}")),
+        }
+    }
+    out
+}
+
+/// Whether the placed photos go all the way round: their viewing directions, measured about the
+/// panorama's own vertical (the normal of the plane the cameras' horizontal axes span, as in
+/// [`level`]), leave no gap wider than 100°. Done in that frame because the reference photo may
+/// itself point steeply up or down.
+fn ring_closes(rots: &[Option<Rotation3<f64>>]) -> bool {
+    let placed: Vec<&Rotation3<f64>> = rots.iter().flatten().collect();
+    if placed.len() < 4 {
+        return false;
+    }
+    let mut c = Matrix3::<f64>::zeros();
+    for r in &placed {
+        let x: V3 = *r * V3::x();
+        c += x * x.transpose();
+    }
+    let eig = SymmetricEigen::new(c);
+    let k = (0..3).min_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b])).unwrap();
+    let up: V3 = eig.eigenvectors.column(k).into_owned().normalize();
+    let e1 = if up.x.abs() < 0.9 { up.cross(&V3::x()) } else { up.cross(&V3::y()) }.normalize();
+    let e2 = up.cross(&e1);
+    let mut yaws: Vec<f64> =
+        placed.iter().map(|r| *r * V3::z()).filter(|d| d.dot(&up).abs() < 0.85).map(|d| d.dot(&e2).atan2(d.dot(&e1))).collect();
+    if yaws.len() < 4 {
+        return false;
+    }
+    yaws.sort_by(|a, b| a.total_cmp(b));
+    let mut gap = yaws[0] + std::f64::consts::TAU - yaws[yaws.len() - 1];
+    for w in yaws.windows(2) {
+        gap = gap.max(w[1] - w[0]);
+    }
+    gap < 100f64.to_radians()
+}
+
+/// Where every photo points, from the verified links alone.
+struct Placement {
+    anchor: usize,
+    rots: Vec<Option<Rotation3<f64>>>,
+    edges: Vec<crate::global::Edge>,
+    keep_edge: Vec<bool>,
+    residuals: Vec<f64>,
+    log: Vec<String>,
+}
+
+/// Global placement: robust rotation averaging over every link, with a focal-length search by global
+/// consistency (a ring only closes at the right focal length) and removal of links that contradict
+/// the cycles they belong to.
+fn place(project: &mut Project, links: &[Link], opts: &AlignOptions, searched: &mut [bool]) -> Placement {
+    let n = project.images.len();
+    let mut log = Vec::new();
+    let mut degree = vec![0usize; n];
+    for l in links {
+        degree[l.a] += l.pts.len();
+        degree[l.b] += l.pts.len();
+    }
+    let comp0 = components(n, links.iter().map(|l| (l.a, l.b)));
+    let mut comp_weight = HashMap::<usize, usize>::new();
+    for l in links {
+        *comp_weight.entry(comp0[l.a]).or_default() += l.pts.len();
+    }
+    let main = *comp_weight.iter().max_by_key(|(c, w)| (**w, usize::MAX - **c)).unwrap().0;
+    let anchor = (0..n).filter(|&i| comp0[i] == main).max_by_key(|&i| (degree[i], usize::MAX - i)).unwrap();
+    let pair_points: Vec<crate::global::PairPoints> = links
+        .iter()
+        .map(|l| crate::global::PairPoints { a: l.a, b: l.b, pts: l.pts.iter().map(|p| (p[0], p[1], p[2], p[3])).collect() })
+        .collect();
+    let lens_idx: Vec<usize> = project.images.iter().map(|i| i.lens).collect();
+    if opts.lens.is_none() && opts.optimize_lens {
+        for li in 0..project.lenses.len() {
+            if !lens_idx.contains(&li) {
+                continue;
+            }
+            let base = project.lenses[li];
+            let f0 = base.focal_px();
+            let eval_full = |f: f64| {
+                let mut models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
+                let mut l = base;
+                l.set_focal_px(f);
+                models[li] = l.model();
+                crate::global::consistency_cost(n, &pair_points, &models, &lens_idx, anchor)
+            };
+            let eval = |f: f64| eval_full(f).0;
+            // The focal length is only well determined by global consistency when the photos close
+            // a ring: elsewhere it trades off against the spacing of the shots. A badly wrong start
+            // can tear the ring open (pairs then disagree around it), so look for one over a range.
+            let is_ring = |f: f64| ring_closes(&eval_full(f).1);
+            let ring = [1.0, 1.3, 0.77, 1.6].iter().any(|&s| is_ring(f0 * s));
+            if !ring {
+                continue;
+            }
+            // Coarse logarithmic grid, ±40 %, then golden-section refinement.
+            let grid: Vec<f64> = (0..=28).map(|k| f0 * (0.7f64.ln() + (1.45f64.ln() - 0.7f64.ln()) * k as f64 / 28.0).exp()).collect();
+            let costs: Vec<f64> = grid.par_iter().map(|&f| eval(f)).collect();
+            let (kbest, _) = costs.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+            let (mut lo, mut hi) = (grid[kbest.saturating_sub(1)], grid[(kbest + 1).min(grid.len() - 1)]);
+            let g = 0.5 * (5f64.sqrt() - 1.0);
+            let (mut x1, mut x2) = (hi - g * (hi - lo), lo + g * (hi - lo));
+            let (mut c1, mut c2) = (eval(x1), eval(x2));
+            for _ in 0..14 {
+                if c1 < c2 {
+                    hi = x2;
+                    x2 = x1;
+                    c2 = c1;
+                    x1 = hi - g * (hi - lo);
+                    c1 = eval(x1);
+                } else {
+                    lo = x1;
+                    x1 = x2;
+                    c1 = c2;
+                    x2 = lo + g * (hi - lo);
+                    c2 = eval(x2);
+                }
+            }
+            let f_best = 0.5 * (lo + hi);
+            // Only trust a clear optimum (a flat cost means the focal length is unobservable).
+            let (c_best, rots_best) = eval_full(f_best);
+            let c_far = costs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            // Judge the optimum on the mean reprojection cost alone (photos outside the group add
+            // a constant that would otherwise swamp the comparison).
+            let missing = rots_best.iter().filter(|r| r.is_none()).count() as f64 * crate::global::MISSING_COST;
+            let (c_best, c_far) = (c_best - missing, c_far - missing);
+            if c_far > c_best * 1.05 {
+                let before = base.hfov;
+                project.lenses[li].set_focal_px(f_best);
+                searched[li] = true;
+                log.push(format!(
+                    "Lens {}: focal length {:.0} px ({:.1}° wide) from global consistency (started at {:.1}°)",
+                    li + 1,
+                    f_best,
+                    project.lenses[li].hfov,
+                    before
+                ));
+            }
+        }
+    }
+    let models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
+    let learned: Vec<bool> = links.iter().map(|l| l.learned).collect();
+    let edges: Vec<crate::global::Edge> = pair_points
+        .iter()
+        .enumerate()
+        .map(|(k, p)| {
+            let (ma, mb) = (&models[lens_idx[p.a]], &models[lens_idx[p.b]]);
+            let rays: Vec<(V3, V3)> = p
+                .pts
+                .iter()
+                .map(|&(ax, ay, bx, by)| (ma.pixel_to_ray(ax as f64, ay as f64), mb.pixel_to_ray(bx as f64, by as f64)))
+                .collect();
+            let r = crate::matching::kabsch(rays.iter().copied()).unwrap_or_else(Rotation3::identity);
+            // Learned links bridge groups; where they close cycles with SIFT links, SIFT decides.
+            let trust = if learned[k] { 0.4 } else { 1.0 };
+            crate::global::Edge { a: p.a, b: p.b, r, w: trust * (p.pts.len() as f64).sqrt() }
+        })
+        .collect();
+    let (rots, keep_edge, residuals) = crate::global::average_robust(n, &edges, anchor);
+    Placement { anchor, rots, edges, keep_edge, residuals, log }
+}
+
 fn thin_points(points: Vec<ControlPoint>, max: usize, w: f32, h: f32) -> Vec<ControlPoint> {
     if points.len() <= max {
         return points;
@@ -282,12 +716,47 @@ fn median(mut v: Vec<f32>) -> f32 {
 }
 
 /// Drops control points whose distance is far above the typical one. Returns how many were removed.
+/// A pair that is the only link between two groups of photos keeps its best points even when they
+/// are noisier than the rest (learned matches, strong parallax): pruning never splits the panorama.
 fn prune(project: &mut Project, floor_px: f32, sigmas: f32) -> usize {
     optimize::update_errors(project);
     let med = median(project.control_points.iter().map(|c| c.error).collect());
     let thr = (med * sigmas).max(floor_px);
     let before = project.control_points.len();
-    project.control_points.retain(|c| c.error <= thr);
+    let (mut keep, dropped): (Vec<ControlPoint>, Vec<ControlPoint>) =
+        std::mem::take(&mut project.control_points).into_iter().partition(|c| c.error <= thr);
+    if !dropped.is_empty() {
+        let n = project.images.len();
+        let mut kept_per_pair: HashMap<(u32, u32), usize> = HashMap::new();
+        for c in &keep {
+            *kept_per_pair.entry((c.a, c.b)).or_default() += 1;
+        }
+        let mut comp = components(n, kept_per_pair.iter().filter(|(_, &k)| k >= 3).map(|(p, _)| (p.0 as usize, p.1 as usize)));
+        let mut by_pair: HashMap<(u32, u32), Vec<ControlPoint>> = HashMap::new();
+        for c in dropped {
+            by_pair.entry((c.a, c.b)).or_default().push(c);
+        }
+        let mut pairs: Vec<((u32, u32), Vec<ControlPoint>)> = by_pair.into_iter().collect();
+        for (_, v) in &mut pairs {
+            v.sort_by(|a, b| a.error.total_cmp(&b.error));
+        }
+        pairs.sort_by(|a, b| a.1[0].error.total_cmp(&b.1[0].error).then(a.0.cmp(&b.0)));
+        for ((a, b), pts) in pairs {
+            let kept = kept_per_pair.get(&(a, b)).copied().unwrap_or(0);
+            let (ra, rb) = (find_root(&mut comp, a as usize), find_root(&mut comp, b as usize));
+            if ra == rb || kept + pts.len() < 6 {
+                continue;
+            }
+            let restore: Vec<ControlPoint> = pts.into_iter().take(8usize.saturating_sub(kept)).collect();
+            // A gross outlier pair (wrong match) stays dropped.
+            if median(restore.iter().map(|c| c.error).collect()) > thr * 8.0 {
+                continue;
+            }
+            keep.extend(restore);
+            comp[ra] = rb;
+        }
+    }
+    project.control_points = keep;
     before - project.control_points.len()
 }
 
@@ -427,162 +896,99 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
     let mut verified: Vec<(Pair, crate::matching::RotationFit)> = promising.par_iter().filter_map(|&(a, b)| verify(a, b)).collect();
 
     // Images left unconnected get a full match against everything (the quick pass can miss thin overlaps).
-    let connected = |verified: &[(Pair, crate::matching::RotationFit)]| {
-        let mut comp: Vec<usize> = (0..n).collect();
-        fn find(c: &mut [usize], i: usize) -> usize {
-            let mut r = i;
-            while c[r] != r {
-                r = c[r];
-            }
-            c[i] = r;
-            r
-        }
-        for (p, _) in verified {
-            let (ra, rb) = (find(&mut comp, p.a), find(&mut comp, p.b));
-            comp[ra] = rb;
-        }
-        (0..n).map(|i| find(&mut comp, i)).collect::<Vec<_>>()
-    };
-    let comp = connected(&verified);
-    if comp.iter().any(|&c| c != comp[0]) {
+    let comp = components(n, verified.iter().map(|(p, _)| (p.a, p.b)));
+    if count_groups(&comp) > 1 {
         progress(0.45, "Searching for more overlaps");
-        let tried: std::collections::HashSet<(usize, usize)> = promising.iter().copied().collect();
+        let tried: HashSet<(usize, usize)> = promising.iter().copied().collect();
         let extra: Vec<(usize, usize)> =
             all_pairs.iter().copied().filter(|&(a, b)| comp[a] != comp[b] && !tried.contains(&(a, b))).collect();
         verified.extend(extra.par_iter().filter_map(|&(a, b)| verify(a, b)).collect::<Vec<_>>());
     }
     verified.sort_by_key(|(p, _)| (p.a, p.b));
-    for (p, fit) in &verified {
-        report.pairs.push(PairStat { a: p.a, b: p.b, matches: p.raw.len(), inliers: fit.inliers.len() });
-    }
-    anyhow::ensure!(
-        !verified.is_empty(),
-        "No overlapping images were found. Check that the photos overlap by at least 20–30 % and that the lens type is right."
-    );
-
-    // 4. Global placement: robust rotation averaging over every verified pair, with a focal-length
-    //    search by global consistency (a ring only closes at the right focal length) and removal of
-    //    pairs that contradict the cycles they belong to.
-    progress(0.5, "Placing images");
-    let mut degree = vec![0usize; n];
-    for (p, fit) in &verified {
-        degree[p.a] += fit.inliers.len();
-        degree[p.b] += fit.inliers.len();
-    }
-    let comp0 = connected(&verified);
-    let mut comp_weight = std::collections::HashMap::<usize, usize>::new();
-    for (p, fit) in &verified {
-        *comp_weight.entry(comp0[p.a]).or_default() += fit.inliers.len();
-    }
-    let main = *comp_weight.iter().max_by_key(|(c, w)| (**w, usize::MAX - **c)).unwrap().0;
-    let anchor = (0..n).filter(|&i| comp0[i] == main).max_by_key(|&i| (degree[i], usize::MAX - i)).unwrap();
-    let pair_points: Vec<crate::global::PairPoints> = verified
+    let mut links: Vec<Link> = verified
         .iter()
-        .map(|(p, fit)| crate::global::PairPoints {
+        .map(|(p, fit)| Link {
             a: p.a,
             b: p.b,
+            matches: p.raw.len(),
+            learned: false,
             pts: fit
                 .inliers
                 .iter()
                 .map(|&k| {
                     let m = p.raw[k];
                     let (fa, fb) = (&features[p.a].feats[m.a as usize], &features[p.b].feats[m.b as usize]);
-                    (fa.x, fa.y, fb.x, fb.y)
+                    [fa.x, fa.y, fb.x, fb.y]
                 })
                 .collect(),
         })
         .collect();
-    let lens_idx: Vec<usize> = project.images.iter().map(|i| i.lens).collect();
+    drop(verified);
+
+    // 3b. Photos SIFT could not connect: learned features, matched across the separate groups.
+    if let Some(rescue) = &opts.rescue {
+        if count_groups(&components(n, links.iter().map(|l| (l.a, l.b)))) > 1 {
+            progress(0.46, "Learned matching");
+            rescue_pass(project, &models, &mut links, rescue.0.as_ref(), &quick, &mut report, &|f, s| progress(0.46 + 0.04 * f, s));
+        }
+    }
+    for l in &links {
+        report.pairs.push(PairStat { a: l.a, b: l.b, matches: l.matches, inliers: l.pts.len(), learned: l.learned });
+    }
+    anyhow::ensure!(
+        !links.is_empty(),
+        "No overlapping images were found. Check that the photos overlap by at least 20–30 % and that the lens type is right."
+    );
+
+    // 4. Global placement.
+    progress(0.5, "Placing images");
     let mut searched = vec![false; project.lenses.len()];
-    if opts.lens.is_none() && opts.optimize_lens {
-        for li in 0..project.lenses.len() {
-            if !lens_idx.contains(&li) {
-                continue;
-            }
-            let base = project.lenses[li];
-            let f0 = base.focal_px();
-            let eval_full = |f: f64| {
-                let mut models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
-                let mut l = base;
-                l.set_focal_px(f);
-                models[li] = l.model();
-                crate::global::consistency_cost(n, &pair_points, &models, &lens_idx, anchor)
-            };
-            let eval = |f: f64| eval_full(f).0;
-            // The focal length is only well determined by global consistency when the photos close
-            // a ring: elsewhere it trades off against the spacing of the shots.
-            let (_, rots0) = eval_full(f0);
-            let mut yaws: Vec<f64> = rots0
-                .iter()
-                .flatten()
-                .map(|r| r * V3::z())
-                .filter(|d| d.y.abs() < 0.85)
-                .map(|d| d.x.atan2(d.z))
+    let mut placed = place(project, &links, opts, &mut searched);
+    // 4b. With the layout known, weakly tied photos get learned matching against every photo they
+    //     are now predicted to overlap: closing rings and cross-links is what makes the layout rigid.
+    if let Some(rescue) = &opts.rescue {
+        let mut strength = vec![0usize; n];
+        for l in &links {
+            strength[l.a] += l.pts.len();
+            strength[l.b] += l.pts.len();
+        }
+        let weak = (0..n).any(|i| placed.rots[i].is_some() && strength[i] < 60);
+        if weak || links.iter().any(|l| l.learned) {
+            let linked: HashSet<(usize, usize)> = links.iter().map(|l| (l.a, l.b)).collect();
+            let models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
+            let mut cands: Vec<((usize, usize), f64)> = (0..n)
+                .flat_map(|a| (a + 1..n).map(move |b| (a, b)))
+                .filter(|p| !linked.contains(p))
+                .filter_map(|(a, b)| {
+                    let (ra, rb) = (placed.rots[a]?, placed.rots[b]?);
+                    let ov = predicted_overlap(&models[project.images[a].lens], &models[project.images[b].lens], &ra, &rb);
+                    (ov >= 0.12).then_some(((a, b), ov))
+                })
                 .collect();
-            yaws.sort_by(|a, b| a.total_cmp(b));
-            let ring = yaws.len() >= 4 && {
-                let mut gap = yaws[0] + std::f64::consts::TAU - yaws[yaws.len() - 1];
-                for w in yaws.windows(2) {
-                    gap = gap.max(w[1] - w[0]);
+            cands.sort_by(|x, y| y.1.total_cmp(&x.1));
+            cands.truncate(6 * n);
+            if !cands.is_empty() {
+                progress(0.5, "Learned matching of predicted overlaps");
+                let pairs: Vec<(usize, usize)> = cands.iter().map(|c| c.0).collect();
+                let rots = placed.rots.clone();
+                let expect = move |a: usize, b: usize| rots[a].zip(rots[b]).map(|(ra, rb)| ra.inverse() * rb);
+                let new = rescue_match(project, &models, rescue.0.as_ref(), &pairs, Some(&expect), &mut report, &|f, s| {
+                    progress(0.5 + 0.05 * f, s)
+                });
+                if !new.is_empty() {
+                    report.log.push(format!("Learned matching of predicted overlaps: {} of {} pairs verified", new.len(), pairs.len()));
+                    for l in &new {
+                        report.pairs.push(PairStat { a: l.a, b: l.b, matches: l.matches, inliers: l.pts.len(), learned: true });
+                    }
+                    links.extend(new);
+                    links.sort_by_key(|l| (l.a, l.b));
+                    placed = place(project, &links, opts, &mut searched);
                 }
-                gap < 100f64.to_radians()
-            };
-            if !ring {
-                continue;
-            }
-            // Coarse logarithmic grid, ±40 %, then golden-section refinement.
-            let grid: Vec<f64> = (0..=28).map(|k| f0 * (0.7f64.ln() + (1.45f64.ln() - 0.7f64.ln()) * k as f64 / 28.0).exp()).collect();
-            let costs: Vec<f64> = grid.par_iter().map(|&f| eval(f)).collect();
-            let (kbest, _) = costs.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)).unwrap();
-            let (mut lo, mut hi) = (grid[kbest.saturating_sub(1)], grid[(kbest + 1).min(grid.len() - 1)]);
-            let g = 0.5 * (5f64.sqrt() - 1.0);
-            let (mut x1, mut x2) = (hi - g * (hi - lo), lo + g * (hi - lo));
-            let (mut c1, mut c2) = (eval(x1), eval(x2));
-            for _ in 0..14 {
-                if c1 < c2 {
-                    hi = x2;
-                    x2 = x1;
-                    c2 = c1;
-                    x1 = hi - g * (hi - lo);
-                    c1 = eval(x1);
-                } else {
-                    lo = x1;
-                    x1 = x2;
-                    c1 = c2;
-                    x2 = lo + g * (hi - lo);
-                    c2 = eval(x2);
-                }
-            }
-            let f_best = 0.5 * (lo + hi);
-            // Only trust a clear optimum (a flat cost means the focal length is unobservable).
-            let c_best = eval(f_best);
-            let c_far = costs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            if c_far > c_best * 1.05 {
-                let before = base.hfov;
-                project.lenses[li].set_focal_px(f_best);
-                searched[li] = true;
-                report.log.push(format!(
-                    "Lens {}: focal length {:.0} px ({:.1}° wide) from global consistency (started at {:.1}°)",
-                    li + 1,
-                    f_best,
-                    project.lenses[li].hfov,
-                    before
-                ));
             }
         }
     }
-    let models: Vec<LensModel> = project.lenses.iter().map(|l| l.model()).collect();
-    let edges: Vec<crate::global::Edge> = pair_points
-        .iter()
-        .map(|p| {
-            let (ma, mb) = (&models[lens_idx[p.a]], &models[lens_idx[p.b]]);
-            let rays: Vec<(V3, V3)> =
-                p.pts.iter().map(|&(ax, ay, bx, by)| (ma.pixel_to_ray(ax as f64, ay as f64), mb.pixel_to_ray(bx as f64, by as f64))).collect();
-            let r = crate::matching::kabsch(rays.iter().copied()).unwrap_or_else(Rotation3::identity);
-            crate::global::Edge { a: p.a, b: p.b, r, w: (p.pts.len() as f64).sqrt() }
-        })
-        .collect();
-    let (rots, keep_edge, residuals) = crate::global::average_robust(n, &edges, anchor);
+    report.log.append(&mut placed.log);
+    let Placement { anchor, rots, edges, keep_edge, residuals, .. } = placed;
     let dropped: Vec<String> = edges
         .iter()
         .zip(&keep_edge)
@@ -594,12 +1000,12 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
         report.log.push(format!("Dropped {} inconsistent pair(s): {}", dropped.len(), dropped.join(", ")));
     }
     let mut k = 0;
-    verified.retain(|_| {
+    links.retain(|_| {
         let keep = keep_edge[k];
         k += 1;
         keep
     });
-    report.pairs.retain(|ps| verified.iter().any(|(p, _)| p.a == ps.a && p.b == ps.b));
+    report.pairs.retain(|ps| links.iter().any(|l| l.a == ps.a && l.b == ps.b));
     for i in 0..n {
         if let Some(r) = rots[i] {
             project.images[i].set_rot(&r);
@@ -610,20 +1016,16 @@ pub fn align(project: &mut Project, features: &[FeatureSet], opts: &AlignOptions
     }
 
     // 5. Control points from the verified matches.
-    for (p, fit) in &verified {
-        if !(project.images[p.a].aligned && project.images[p.b].aligned) {
+    for l in &links {
+        if !(project.images[l.a].aligned && project.images[l.b].aligned) {
             continue;
         }
-        let pts: Vec<ControlPoint> = fit
-            .inliers
+        let pts: Vec<ControlPoint> = l
+            .pts
             .iter()
-            .map(|&k| {
-                let m = p.raw[k];
-                let (fa, fb) = (&features[p.a].feats[m.a as usize], &features[p.b].feats[m.b as usize]);
-                ControlPoint { a: p.a as u32, b: p.b as u32, ax: fa.x, ay: fa.y, bx: fb.x, by: fb.y, error: 0.0 }
-            })
+            .map(|p| ControlPoint { a: l.a as u32, b: l.b as u32, ax: p[0], ay: p[1], bx: p[2], by: p[3], error: 0.0 })
             .collect();
-        let (w, h) = (project.images[p.a].width as f32, project.images[p.a].height as f32);
+        let (w, h) = (project.images[l.a].width as f32, project.images[l.a].height as f32);
         project.control_points.extend(thin_points(pts, opts.max_points_per_pair, w, h));
     }
 
@@ -807,11 +1209,29 @@ fn guided_points(project: &mut Project, features: &[FeatureSet], opts: &AlignOpt
             thin_points(pts, opts.max_points_per_pair, project.images[a].width as f32, project.images[a].height as f32)
         })
         .collect();
-    let total: usize = found.iter().map(|v| v.len()).sum();
-    if total > project.control_points.len() {
-        project.control_points = found.into_iter().flatten().collect();
-        total
-    } else {
-        0
+    // Per pair, keep whichever set is larger: guided SIFT can find fewer points than the pair already
+    // has (low texture, learned matches), and must not cut a photo loose.
+    let mut existing: HashMap<(u32, u32), Vec<ControlPoint>> = HashMap::new();
+    for c in &project.control_points {
+        existing.entry((c.a, c.b)).or_default().push(*c);
     }
+    let before = project.control_points.len();
+    let mut out: Vec<ControlPoint> = Vec::new();
+    let mut gained = false;
+    for (&(a, b), pts) in pairs.iter().zip(found) {
+        let old = existing.remove(&(a as u32, b as u32)).unwrap_or_default();
+        if pts.len() > old.len() {
+            gained = true;
+            out.extend(pts);
+        } else {
+            out.extend(old);
+        }
+    }
+    out.extend(existing.into_values().flatten());
+    if !gained {
+        return 0;
+    }
+    out.sort_by_key(|c| (c.a, c.b));
+    project.control_points = out;
+    project.control_points.len().saturating_sub(before).max(1)
 }

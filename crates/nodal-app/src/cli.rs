@@ -106,6 +106,10 @@ pub enum Command {
         /// Keep the lens exactly as given: do not calibrate field of view and distortion.
         #[arg(long)]
         no_lens_optimization: bool,
+        /// Never use the learned matcher for photos ordinary matching cannot connect (it downloads
+        /// its 65 MB of models the first time it is needed).
+        #[arg(long)]
+        no_learned: bool,
         /// Do not level the horizon.
         #[arg(long)]
         no_level: bool,
@@ -218,6 +222,7 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             no_exposure,
             no_local,
             no_lens_optimization,
+            no_learned,
             no_level,
             no_trim,
             project,
@@ -255,7 +260,15 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
             };
             let sources = nodal_stitch::load_sources(&images, &DetectOptions::default(), &|f, s| show(f * 0.25, s))?;
             let t_load = t0.elapsed();
-            let align_opts = AlignOptions { lens, optimize_lens: !no_lens_optimization, level: !no_level, ..Default::default() };
+            #[allow(unused_mut)]
+            let mut align_opts = AlignOptions { lens, optimize_lens: !no_lens_optimization, level: !no_level, ..Default::default() };
+            #[cfg(feature = "ml")]
+            if !no_learned {
+                align_opts.rescue =
+                    Some(nodal_stitch::align::RescueHandle(std::sync::Arc::new(nodal_stitch::ml::SourceRescue::new(&sources))));
+            }
+            #[cfg(not(feature = "ml"))]
+            let _ = no_learned;
             let (mut proj, report) = nodal_stitch::align_sources(&sources, &align_opts, &|f, s| show(0.25 + f * 0.25, s))?;
             let t_align = t0.elapsed();
             proj.output.width = width.unwrap_or(0);
@@ -291,6 +304,13 @@ fn run_inner(cmd: Command) -> anyhow::Result<()> {
                 report.rms,
                 report.max
             );
+            let learned = report.pairs.iter().filter(|p| p.learned).count();
+            if learned > 0 {
+                println!("  learned matcher: connected {learned} pairs ordinary matching could not");
+            }
+            for line in report.log.iter().filter(|l| l.starts_with("Learned matching unavailable")) {
+                println!("  {line}");
+            }
             if let Some(local) = report.local.filter(|l| l.images_warped > 0) {
                 println!("  local alignment: RMS {:.2} → {:.2} px", local.before, local.after);
             }

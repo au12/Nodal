@@ -114,7 +114,9 @@ pub fn probe(path: &Path) -> Result<ImageInfo> {
     let kind = sniff(path)?;
     match kind {
         SourceKind::Raw => {
-            let raw = flashraw::FlashRaw::open_path(path).map_err(|e| anyhow!("{e}")).with_context(|| format!("could not read {}", path.display()))?;
+            let raw = flashraw::FlashRaw::open_path(path)
+                .map_err(|e| anyhow!("{e}"))
+                .with_context(|| format!("could not read {}", path.display()))?;
             Ok(raw_info(&raw, true))
         }
         SourceKind::Psd => {
@@ -185,7 +187,7 @@ fn raw_info(raw: &flashraw::FlashRaw, _with_size: bool) -> ImageInfo {
         lens: m.lens.model.clone(),
         focal_mm: m.exposure.focal_length.map(|v| v as f64).filter(|v| *v > 0.0),
         focal_35mm: m.exposure.focal_length_35mm.map(|v| v as f64).filter(|v| *v > 0.0),
-        exposure_time: m.exposure.exposure_time.map(|v| v as f64).filter(|v| *v > 0.0),
+        exposure_time: m.exposure.exposure_time.filter(|v| *v > 0.0),
         f_number: m.exposure.f_number.map(|v| v as f64).filter(|v| *v > 0.0),
         iso: m.exposure.iso.map(|v| v as f64).filter(|v| *v > 0.0),
         taken: m.capture_time.clone(),
@@ -199,14 +201,7 @@ fn raw_info(raw: &flashraw::FlashRaw, _with_size: bool) -> ImageInfo {
         exif.taken = exif.taken.or(ex.taken);
     }
     let wb = fi.white_balance.as_ref().map(|wb| [wb.coeffs[0], wb.coeffs[1], wb.coeffs[2]]);
-    ImageInfo {
-        width: w,
-        height: h,
-        exif,
-        kind: SourceKind::Raw,
-        format: format!("{fmt} {}-bit", m.bits_per_sample),
-        as_shot_wb: wb,
-    }
+    ImageInfo { width: w, height: h, exif, kind: SourceKind::Raw, format: format!("{fmt} {}-bit", m.bits_per_sample), as_shot_wb: wb }
 }
 
 /// Decodes to scene-linear RGB with orientation applied.
@@ -224,7 +219,8 @@ pub fn decode_linear(path: &Path, settings: &DecodeSettings) -> Result<(LinearIm
 
 fn decode_raw(path: &Path, settings: &DecodeSettings) -> Result<(LinearImage, ImageInfo)> {
     use flashraw::{Backend, DecodeOptions, Demosaic, OutputFormat};
-    let raw = flashraw::FlashRaw::open_path(path).map_err(|e| anyhow!("{e}")).with_context(|| format!("could not read {}", path.display()))?;
+    let raw =
+        flashraw::FlashRaw::open_path(path).map_err(|e| anyhow!("{e}")).with_context(|| format!("could not read {}", path.display()))?;
     let info = raw_info(&raw, true);
     let fi = raw.frame_info();
     let area = fi.active_area;

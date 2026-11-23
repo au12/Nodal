@@ -30,12 +30,7 @@ pub struct PhotoReport {
 
 impl PhotoReport {
     pub fn summary(&self) -> String {
-        let falloff = self
-            .corner_falloff
-            .iter()
-            .map(|f| format!("{:.2} EV", -f.max(1e-3).log2()))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let falloff = self.corner_falloff.iter().map(|f| format!("{:.2} EV", -f.max(1e-3).log2())).collect::<Vec<_>>().join(", ");
         format!(
             "Photometric calibration: {} samples, mismatch {:.3} → {:.3} EV, vignetting at corners {}, exposure spread {:.2} EV",
             self.samples, self.rms_before, self.rms_after, falloff, self.exposure_spread
@@ -194,8 +189,10 @@ pub fn calibrate(project: &mut Project, sources: &[Source]) -> PhotoReport {
     if active.len() < 2 {
         return PhotoReport::default();
     }
-    let smooth: Vec<Option<Smooth>> =
-        (0..n_img).into_par_iter().map(|i| (project.images[i].aligned && project.images[i].enabled).then(|| Smooth::new(&sources[i]))).collect();
+    let smooth: Vec<Option<Smooth>> = (0..n_img)
+        .into_par_iter()
+        .map(|i| (project.images[i].aligned && project.images[i].enabled).then(|| Smooth::new(&sources[i])))
+        .collect();
     let samples = collect_samples(project, sources, &smooth);
     drop(smooth);
     if samples.len() < 50 {
@@ -210,10 +207,12 @@ pub fn calibrate(project: &mut Project, sources: &[Source]) -> PhotoReport {
         v.get(v.len() / 2).copied()
     };
     // Prior: brighter capture settings (lower EV) mean brighter pixels: log g = (ev_ref − ev)·ln 2.
-    let prior: Vec<f64> = (0..n_img).map(|i| match (ev[i], ev_ref) {
-        (Some(e), Some(r)) => (r - e) * std::f64::consts::LN_2,
-        _ => 0.0,
-    }).collect();
+    let prior: Vec<f64> = (0..n_img)
+        .map(|i| match (ev[i], ev_ref) {
+            (Some(e), Some(r)) => (r - e) * std::f64::consts::LN_2,
+            _ => 0.0,
+        })
+        .collect();
     let lens_of: Vec<usize> = project.images.iter().map(|im| im.lens).collect();
     let mut per_image = vec![0usize; n_img];
     for s in &samples {
@@ -225,83 +224,84 @@ pub fn calibrate(project: &mut Project, sources: &[Source]) -> PhotoReport {
     // and parallax easily fake tenths.
     let exif_known = active.iter().all(|&i| ev[i].is_some());
 
-    let solve = |target: &dyn Fn(&Sample) -> f64, with_vignetting: bool, fixed_vig: &[[f64; 3]], prior_w: f64| -> (DVector<f64>, f64, f64) {
-        let mut x = DVector::<f64>::zeros(nv);
-        let mut rms0 = 0.0;
-        let mut rms1 = 0.0;
-        let mut delta = 0.25f64; // Huber threshold (natural log units)
-        for it in 0..6 {
-            let mut a = DMatrix::<f64>::zeros(nv, nv);
-            let mut b = DVector::<f64>::zeros(nv);
-            let mut sq = 0.0;
-            let mut wsum = 0.0;
-            for s in &samples {
-                let (i, j) = (s.i as usize, s.j as usize);
-                let (li, lj) = (lens_of[i], lens_of[j]);
-                let (r2i, r2j) = (s.r2i as f64, s.r2j as f64);
-                let pi = [r2i, r2i * r2i, r2i * r2i * r2i];
-                let pj = [r2j, r2j * r2j, r2j * r2j * r2j];
-                // residual = d − (gi − gj) − (Vi − Vj), d = log Ii − log Ij.
-                let mut d = target(s);
-                if !with_vignetting {
-                    let vi: f64 = (0..3).map(|k| fixed_vig[li][k] * pi[k]).sum();
-                    let vj: f64 = (0..3).map(|k| fixed_vig[lj][k] * pj[k]).sum();
-                    d -= vi - vj;
-                }
-                let mut pred = x[i] - x[j];
-                if with_vignetting {
-                    for k in 0..3 {
-                        pred += x[n_img + 3 * li + k] * pi[k] - x[n_img + 3 * lj + k] * pj[k];
+    let solve =
+        |target: &dyn Fn(&Sample) -> f64, with_vignetting: bool, fixed_vig: &[[f64; 3]], prior_w: f64| -> (DVector<f64>, f64, f64) {
+            let mut x = DVector::<f64>::zeros(nv);
+            let mut rms0 = 0.0;
+            let mut rms1 = 0.0;
+            let mut delta = 0.25f64; // Huber threshold (natural log units)
+            for it in 0..6 {
+                let mut a = DMatrix::<f64>::zeros(nv, nv);
+                let mut b = DVector::<f64>::zeros(nv);
+                let mut sq = 0.0;
+                let mut wsum = 0.0;
+                for s in &samples {
+                    let (i, j) = (s.i as usize, s.j as usize);
+                    let (li, lj) = (lens_of[i], lens_of[j]);
+                    let (r2i, r2j) = (s.r2i as f64, s.r2j as f64);
+                    let pi = [r2i, r2i * r2i, r2i * r2i * r2i];
+                    let pj = [r2j, r2j * r2j, r2j * r2j * r2j];
+                    // residual = d − (gi − gj) − (Vi − Vj), d = log Ii − log Ij.
+                    let mut d = target(s);
+                    if !with_vignetting {
+                        let vi: f64 = (0..3).map(|k| fixed_vig[li][k] * pi[k]).sum();
+                        let vj: f64 = (0..3).map(|k| fixed_vig[lj][k] * pj[k]).sum();
+                        d -= vi - vj;
+                    }
+                    let mut pred = x[i] - x[j];
+                    if with_vignetting {
+                        for k in 0..3 {
+                            pred += x[n_img + 3 * li + k] * pi[k] - x[n_img + 3 * lj + k] * pj[k];
+                        }
+                    }
+                    let r = d - pred;
+                    if it == 0 {
+                        rms0 += r * r;
+                    }
+                    let w = if r.abs() <= delta { 1.0 } else { delta / r.abs() };
+                    sq += w * r * r;
+                    wsum += w;
+                    // Jacobian row.
+                    let mut idx: Vec<(usize, f64)> = vec![(i, 1.0), (j, -1.0)];
+                    if with_vignetting {
+                        for k in 0..3 {
+                            idx.push((n_img + 3 * li + k, pi[k]));
+                            idx.push((n_img + 3 * lj + k, -pj[k]));
+                        }
+                    }
+                    for &(p, vp) in &idx {
+                        b[p] += w * vp * r;
+                        for &(q, vq) in &idx {
+                            a[(p, q)] += w * vp * vq;
+                        }
                     }
                 }
-                let r = d - pred;
                 if it == 0 {
-                    rms0 += r * r;
+                    rms0 = (rms0 / samples.len() as f64).sqrt();
                 }
-                let w = if r.abs() <= delta { 1.0 } else { delta / r.abs() };
-                sq += w * r * r;
-                wsum += w;
-                // Jacobian row.
-                let mut idx: Vec<(usize, f64)> = vec![(i, 1.0), (j, -1.0)];
-                if with_vignetting {
-                    for k in 0..3 {
-                        idx.push((n_img + 3 * li + k, pi[k]));
-                        idx.push((n_img + 3 * lj + k, -pj[k]));
-                    }
+                rms1 = (sq / wsum.max(1e-9)).sqrt();
+                // Priors: gains toward EXIF, vignetting toward zero, unused unknowns pinned.
+                for k in 0..n_img {
+                    let active_k = project.images[k].aligned && project.images[k].enabled;
+                    let w = if active_k { prior_w * if exif_known { per_image[k].max(1) as f64 } else { 1.0 } } else { 1e6 };
+                    let target = if active_k { prior[k] } else { 0.0 };
+                    a[(k, k)] += w;
+                    b[k] += w * (target - x[k]);
                 }
-                for &(p, vp) in &idx {
-                    b[p] += w * vp * r;
-                    for &(q, vq) in &idx {
-                        a[(p, q)] += w * vp * vq;
-                    }
+                for k in n_img..nv {
+                    a[(k, k)] += if with_vignetting { 1e-3 } else { 1e6 };
+                    b[k] += -x[k] * if with_vignetting { 1e-3 } else { 0.0 };
+                }
+                let Some(chol) = a.clone().cholesky() else { break };
+                let step = chol.solve(&b);
+                x += &step;
+                delta = (1.5 * rms1).clamp(0.05, 0.5);
+                if step.amax() < 1e-5 {
+                    break;
                 }
             }
-            if it == 0 {
-                rms0 = (rms0 / samples.len() as f64).sqrt();
-            }
-            rms1 = (sq / wsum.max(1e-9)).sqrt();
-            // Priors: gains toward EXIF, vignetting toward zero, unused unknowns pinned.
-            for k in 0..n_img {
-                let active_k = project.images[k].aligned && project.images[k].enabled;
-                let w = if active_k { prior_w * if exif_known { per_image[k].max(1) as f64 } else { 1.0 } } else { 1e6 };
-                let target = if active_k { prior[k] } else { 0.0 };
-                a[(k, k)] += w;
-                b[k] += w * (target - x[k]);
-            }
-            for k in n_img..nv {
-                a[(k, k)] += if with_vignetting { 1e-3 } else { 1e6 };
-                b[k] += -x[k] * if with_vignetting { 1e-3 } else { 0.0 };
-            }
-            let Some(chol) = a.clone().cholesky() else { break };
-            let step = chol.solve(&b);
-            x += &step;
-            delta = (1.5 * rms1).clamp(0.05, 0.5);
-            if step.amax() < 1e-5 {
-                break;
-            }
-        }
-        (x, rms0, rms1)
-    };
+            (x, rms0, rms1)
+        };
 
     // 1. Luminance: exposure and vignetting.
     let lum = |s: &Sample| luma(&s.ci).ln() - luma(&s.cj).ln();
@@ -373,5 +373,11 @@ pub fn calibrate(project: &mut Project, sources: &[Source]) -> PhotoReport {
         let v = m.lu().solve(&rhs).unwrap_or_else(|| DVector::zeros(3));
         lens.vignette = [v[0], v[1], v[2]];
     }
-    PhotoReport { samples: samples.len(), rms_before: rms0 / std::f64::consts::LN_2, rms_after: rms1 / std::f64::consts::LN_2, corner_falloff: falloff, exposure_spread: spread / std::f64::consts::LN_2 }
+    PhotoReport {
+        samples: samples.len(),
+        rms_before: rms0 / std::f64::consts::LN_2,
+        rms_after: rms1 / std::f64::consts::LN_2,
+        corner_falloff: falloff,
+        exposure_spread: spread / std::f64::consts::LN_2,
+    }
 }

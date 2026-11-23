@@ -138,7 +138,8 @@ impl LumaImage {
     pub fn from_source(s: &Source) -> LumaImage {
         let img = &s.image;
         let (w, h) = (img.width() as usize, img.height() as usize);
-        let v: Vec<f32> = img.as_raw().par_chunks(3).map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0).collect();
+        let v: Vec<f32> =
+            img.as_raw().par_chunks(3).map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0).collect();
         LumaImage { w, h, v, scale: s.work_scale() }
     }
 
@@ -593,7 +594,7 @@ pub fn register(project: &Project, lumas: &[Option<LumaImage>], progress: Progre
         }
         let mut keep = vec![false; pairs.len()];
         for list in per.iter_mut() {
-            list.sort_by(|a, b| b.0.cmp(&a.0));
+            list.sort_by_key(|e| std::cmp::Reverse(e.0));
             for &(_, k) in list.iter().take(3) {
                 keep[k] = true;
             }
@@ -681,12 +682,15 @@ pub fn register(project: &Project, lumas: &[Option<LumaImage>], progress: Progre
             let _ = centre;
             if let Some((da, db)) = dbg_planes {
                 let save = |p: &Plane, name: &str| {
-                    let px: Vec<u8> = p.v.iter().zip(&p.ok).map(|(v, ok)| if *ok { (v * 255.0).clamp(0.0, 255.0) as u8 } else { 0 }).collect();
-                    let _ = image::GrayImage::from_raw(p.w as u32, p.h as u32, px).map(|g| g.save(format!("/tmp/dense_{i}_{j}_{name}.png")));
+                    let px: Vec<u8> =
+                        p.v.iter().zip(&p.ok).map(|(v, ok)| if *ok { (v * 255.0).clamp(0.0, 255.0) as u8 } else { 0 }).collect();
+                    let _ =
+                        image::GrayImage::from_raw(p.w as u32, p.h as u32, px).map(|g| g.save(format!("/tmp/dense_{i}_{j}_{name}.png")));
                 };
                 save(&da, "a");
                 save(&db, "b");
-                let txt: String = raw.iter().map(|r| format!("{:.1} {:.1} {:.2} {:.2} {:.3} {:.3}\n", r.0, r.1, r.2, r.3, r.4, r.5)).collect();
+                let txt: String =
+                    raw.iter().map(|r| format!("{:.1} {:.1} {:.2} {:.2} {:.3} {:.3}\n", r.0, r.1, r.2, r.3, r.4, r.5)).collect();
                 let _ = std::fs::write(format!("/tmp/dense_{i}_{j}_flow.txt"), txt);
             }
             let mut out = Vec::with_capacity(raw.len());
@@ -694,7 +698,16 @@ pub fn register(project: &Project, lumas: &[Option<LumaImage>], progress: Progre
                 let da = view.dir(x as f64, y as f64);
                 let db = view.dir((x + dx) as f64, (y + dy) as f64);
                 let (Some(pa), Some(pb)) = (ci.to_pixel(&da), cj.to_pixel(&db)) else { continue };
-                out.push(DenseMatch { a: i as u32, b: j as u32, ax: pa.0 as f32, ay: pa.1 as f32, bx: pb.0 as f32, by: pb.1 as f32, score: s, sharpness: c });
+                out.push(DenseMatch {
+                    a: i as u32,
+                    b: j as u32,
+                    ax: pa.0 as f32,
+                    ay: pa.1 as f32,
+                    bx: pb.0 as f32,
+                    by: pb.1 as f32,
+                    score: s,
+                    sharpness: c,
+                });
             }
             let k = done.fetch_add(1, Ordering::Relaxed) + 1;
             progress(k as f32 / total as f32, "Measuring overlaps");
@@ -808,16 +821,14 @@ pub fn refine_project(project: &mut Project, sources: &[Source], opts: &AlignOpt
     }
     let (rms0, _, _) = stats(matches.par_iter().map(|m| residual(project, m, false)).collect());
     report.rms_before = rms0;
-    // Second adjustment: the feature control points plus well-spread dense measurements.
+    // Second adjustment: the refined feature control points plus well-spread dense measurements
+    // reaching into the frame corners, where features are scarce.
     progress(0.62, "Optimising with dense measurements");
-    let dense_cps = to_control_points(project, &matches, 60);
-    let saved = project.control_points.clone();
-    project.control_points.extend(dense_cps.iter().copied());
+    let dense_cps = to_control_points(project, &matches, 80);
+    project.control_points.extend(dense_cps);
     let t1 = std::time::Instant::now();
     crate::align::polish(project, opts);
     let t_polish = t1.elapsed().as_secs_f32();
-    project.control_points = saved;
-    project.control_points.extend(dense_cps);
     crate::optimize::update_errors(project);
     let res_after: Vec<f64> = matches.par_iter().map(|m| residual(project, m, false)).collect();
     let (rms1, med1, p90_1) = stats(res_after);
@@ -850,4 +861,104 @@ pub fn refine_project(project: &mut Project, sources: &[Source], opts: &AlignOpt
     }
     progress(1.0, "Overlaps measured");
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoothed value noise sampled with a sub-pixel offset (bilinear in a 4-px lattice, then
+    /// a second octave), so shifted copies are exact.
+    fn texture(w: usize, h: usize, dx: f32, dy: f32) -> Plane {
+        texture_map(w, h, &|x, y| (x - dx, y - dy))
+    }
+
+    fn texture_map(w: usize, h: usize, map: &dyn Fn(f32, f32) -> (f32, f32)) -> Plane {
+        fn hash(x: i64, y: i64) -> f32 {
+            let mut v = (x.wrapping_mul(73856093) ^ y.wrapping_mul(19349663)) as u64;
+            v ^= v >> 13;
+            v = v.wrapping_mul(0x5bd1e995);
+            v ^= v >> 15;
+            (v & 0xffff) as f32 / 65535.0
+        }
+        fn noise(x: f32, y: f32, cell: f32) -> f32 {
+            let (gx, gy) = (x / cell, y / cell);
+            let (x0, y0) = (gx.floor(), gy.floor());
+            let (tx, ty) = (gx - x0, gy - y0);
+            let (sx, sy) = (tx * tx * (3.0 - 2.0 * tx), ty * ty * (3.0 - 2.0 * ty));
+            let (x0, y0) = (x0 as i64, y0 as i64);
+            let a = hash(x0, y0) + (hash(x0 + 1, y0) - hash(x0, y0)) * sx;
+            let b = hash(x0, y0 + 1) + (hash(x0 + 1, y0 + 1) - hash(x0, y0 + 1)) * sx;
+            a + (b - a) * sy
+        }
+        let mut p = Plane::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = map(x as f32 + 0.5, y as f32 + 0.5);
+                p.v[y * w + x] = 0.6 * noise(fx, fy, 6.0) + 0.4 * noise(fx, fy, 2.5);
+                p.ok[y * w + x] = true;
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn measures_known_shift_without_bias() {
+        for &(dx, dy) in &[(1.3f32, 0.7f32), (-2.4, 3.6), (0.25, -0.45), (7.8, -5.2)] {
+            let a = texture(400, 300, 0.0, 0.0);
+            let b = texture(400, 300, dx, dy);
+            let flow = match_planes(a, b, 16, 4);
+            assert!(flow.len() > 100, "too few measurements: {}", flow.len());
+            if std::env::var_os("DUMP_FLOW").is_some() {
+                for f in flow.iter().take(12) {
+                    eprintln!("{:?}", f);
+                }
+            }
+            let n = flow.len() as f32;
+            let mx = flow.iter().map(|f| f.2).sum::<f32>() / n;
+            let my = flow.iter().map(|f| f.3).sum::<f32>() / n;
+            assert!((mx - dx).abs() < 0.05 && (my - dy).abs() < 0.05, "shift ({dx}, {dy}) measured as ({mx:.3}, {my:.3})");
+        }
+    }
+
+    #[test]
+    fn follows_a_smooth_displacement_field() {
+        // b shows a's content displaced by D(x, y) = shift + small rotation and scale about the centre.
+        let (w, h) = (600usize, 420usize);
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let disp = |x: f32, y: f32| {
+            let (u, v) = (x - cx, y - cy);
+            (2.2 + 0.012 * u - 0.006 * v, 1.7 + 0.006 * u + 0.012 * v)
+        };
+        let a = texture_map(w, h, &|x, y| (x, y));
+        // b(p) = a(p - D(p)) approximately (D varies slowly).
+        let b = texture_map(w, h, &|x, y| {
+            let d = disp(x, y);
+            (x - d.0, y - d.1)
+        });
+        let flow = match_planes(a, b, 16, 4);
+        assert!(flow.len() > 200, "too few measurements: {}", flow.len());
+        let mut err = Vec::new();
+        let (mut ex, mut ey) = (0.0f32, 0.0f32);
+        for f in &flow {
+            // Content at a(x) appears in b at x + D(x + D) ≈ solve x' - D(x') = x.
+            let (mut tx, mut ty) = (f.0, f.1);
+            for _ in 0..8 {
+                let d = disp(tx, ty);
+                tx = f.0 + d.0;
+                ty = f.1 + d.1;
+            }
+            let (e0, e1) = (f.0 + f.2 - tx, f.1 + f.3 - ty);
+            ex += e0;
+            ey += e1;
+            err.push((e0 * e0 + e1 * e1).sqrt());
+        }
+        let n = flow.len() as f32;
+        err.sort_by(|a, b| a.total_cmp(b));
+        let med = err[err.len() / 2];
+        if std::env::var_os("DUMP_FLOW").is_some() {
+            eprintln!("smooth field: {} points, median error {med:.3}, mean error ({:.3}, {:.3})", flow.len(), ex / n, ey / n);
+        }
+        assert!(med < 0.1 && (ex / n).abs() < 0.05 && (ey / n).abs() < 0.05, "median {med:.3}, mean ({:.3}, {:.3})", ex / n, ey / n);
+    }
 }
